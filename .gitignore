@@ -1,0 +1,13 @@
+@"
+data/
+logs/
+__pycache__/
+metabase-data/
+postgres-db-volume/
+*.csv
+*.7z
+*.txt
+*.db
+*.mv.db
+.DS_Store
+"@ | Set-Content .gitignore
