@@ -28,9 +28,11 @@ class CagedProcessor:
             for f in os.listdir(RAW_EXTRACT_DIR):
                 try: os.remove(os.path.join(RAW_EXTRACT_DIR, f))
                 except: pass
+            
             with py7zr.SevenZipFile(zip_path, mode='r') as z:
                 z.extractall(path=RAW_EXTRACT_DIR)
-            extracted = [f for f in os.listdir(RAW_EXTRACT_DIR) if f.endswith('.txt')]
+            
+            extracted = [f for f in os.listdir(RAW_EXTRACT_DIR) if f.endswith('.txt') or f.endswith('.csv')]
             return os.path.join(RAW_EXTRACT_DIR, extracted[0]) if extracted else None
         except Exception as e:
             logger.error(f"❌ Erro na extração: {e}")
@@ -74,24 +76,44 @@ class CagedProcessor:
             
             file_cols_norm = {self.normalize_text(c): c for c in q.columns}
             rename_dict = {}
+            
+            # --- CORREÇÃO: LÓGICA DE 2 PASSOS ---
+            
+            # Passo 1: Matches Exatos (Prioridade Máxima)
             for k, v in COLUMNS_MAP.items():
+                if v in rename_dict.values(): continue
                 norm = self.normalize_text(k)
                 if norm in file_cols_norm:
                     rename_dict[file_cols_norm[norm]] = v
-                    continue
+            
+            # Passo 2: Matches Aproximados (Fuzzy) - Apenas para o que sobrou
+            for k, v in COLUMNS_MAP.items():
+                if v in rename_dict.values(): continue # Se já achou no passo 1, pula
+                
+                norm = self.normalize_text(k)
                 for f_norm, f_real in file_cols_norm.items():
                     if f_norm.startswith(norm):
                         rename_dict[f_real] = v
                         break
+            # ------------------------------------
+
+            logger.info(f"📋 Colunas mapeadas: {len(rename_dict)} de {len(COLUMNS_MAP)} (Esperado: ~20)")
             
-            logger.info(f"📋 Colunas mapeadas: {len(rename_dict)} de {len(COLUMNS_MAP)}")
+            # Verifica se colunas cruciais foram encontradas
+            if 'municipio_codigo' not in rename_dict.values():
+                logger.warning("⚠️ ALERTA: Coluna 'municipio_codigo' NÃO foi encontrada no arquivo!")
+                logger.warning(f"   Colunas disponíveis no arquivo: {list(file_cols_norm.keys())}")
+            
             q = q.select(list(rename_dict.keys())).rename(rename_dict)
             
             existing = rename_dict.values()
-            for c in ['uf_codigo', 'municipio_codigo', 'subclasse_codigo', 'saldo_movimentacao']:
+            
+            for c in ['uf_codigo', 'municipio_codigo', 'subclasse_codigo', 'saldo_movimentacao', 'secao_codigo']:
                 if c in existing: q = q.with_columns(pl.col(c).cast(pl.Int64, strict=False))
+                
             if 'salario' in existing:
                 q = q.with_columns(pl.col('salario').str.replace(',', '.').cast(pl.Float64, strict=False))
+                
             if UF_FILTER and 'uf_codigo' in existing:
                 q = q.filter(pl.col('uf_codigo') == UF_FILTER)
                 
@@ -107,7 +129,7 @@ class CagedProcessor:
                 if df_cnae is not None: q = q.join(df_cnae.lazy(), on='subclasse_codigo', how='left')
 
             output_path = os.path.join(PROCESSED_DIR, output_filename)
-            logger.info("💾 Coletando dados para memória (Isso evita travamento no disco)...")
+            logger.info("💾 Coletando dados para memória...")
             df_final = q.collect()
             logger.info(f"💾 Salvando CSV final com {df_final.height} linhas...")
             df_final.write_csv(output_path, separator=';')

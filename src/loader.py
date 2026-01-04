@@ -11,7 +11,8 @@ except ImportError:
     from src.config import PROCESSED_DIR, DB_URL, TABLE_NAME
 
 def get_db_engine():
-    return create_engine(os.getenv('AIRFLOW__DATABASE__SQL_ALCHEMY_CONN', DB_URL))
+    # Adicionamos future=True para garantir compatibilidade moderna, se necessário
+    return create_engine(os.getenv('AIRFLOW__DATABASE__SQL_ALCHEMY_CONN', DB_URL), future=True)
 
 def create_performance_indexes(engine):
     """
@@ -20,30 +21,20 @@ def create_performance_indexes(engine):
     """
     logger.info("⚡ Otimizando banco de dados (Criando Índices)...")
     
-    # Lista de índices estratégicos
     indexes = [
-        # 1. O mais importante: Filtrar por Cidade (Botucatu = 350750)
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_municipio ON {TABLE_NAME} (municipio_codigo);",
-        
-        # 2. Série Temporal: Filtrar por data (ex: Últimos 12 meses)
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_data ON {TABLE_NAME} (competencia_declarada);",
-        
-        # 3. Índice Composto: O "Super Índice" para seus gráficos
-        # Otimiza queries do tipo: "Dados de Botucatu em Setembro/2025"
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_mun_data ON {TABLE_NAME} (municipio_codigo, competencia_declarada);",
-        
-        # 4. Setores: Para comparar Comércio vs Indústria vs Serviços
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_setor ON {TABLE_NAME} (subclasse_codigo);",
-        
-        # 5. Saldo: Para calcular Admissões - Demissões rapidamente
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_saldo ON {TABLE_NAME} (saldo_movimentacao);"
     ]
 
     try:
-        with engine.connect() as conn:
+        # CORREÇÃO AQUI: Usamos engine.begin() para transação automática
+        with engine.begin() as conn:
             for sql in indexes:
                 conn.execute(text(sql))
-                conn.commit()
+            # O commit ocorre automaticamente ao sair do bloco 'with'
         logger.info("⚡ Índices criados/verificados com sucesso!")
     except Exception as e:
         logger.warning(f"⚠️ Aviso: Não foi possível criar índices (pode ser permissão ou já existem): {e}")
@@ -68,9 +59,9 @@ def load_to_database(csv_filename: str):
         inspector = inspect(engine)
         if inspector.has_table(TABLE_NAME):
             logger.info(f"🔄 Limpando dados antigos de {data_ref}...")
-            with engine.connect() as conn:
+            # CORREÇÃO AQUI: Usamos engine.begin() e removemos o conn.commit() manual
+            with engine.begin() as conn:
                 conn.execute(text(f"DELETE FROM {TABLE_NAME} WHERE competencia_declarada = :d"), {"d": data_ref})
-                conn.commit()
         else:
             logger.info(f"🆕 Tabela '{TABLE_NAME}' será criada agora.")
 
