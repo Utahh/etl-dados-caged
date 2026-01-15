@@ -10,6 +10,10 @@ services:
       - POSTGRES_DB=airflow
     ports:
       - "5432:5432"
+    # --- NOVO: Volume para persistência dos dados ---
+    volumes:
+      - ./postgres-db-volume:/var/lib/postgresql/data
+    # ------------------------------------------------
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U airflow"]
       interval: 10s
@@ -66,3 +70,4 @@ services:
     command: >
       bash -c "airflow db init && 
       airflow users create --username airflow --password airflow --firstname Admin --lastname Admin --role Admin --email admin@example.com"
+      

@@ -2,6 +2,7 @@ import os
 import requests
 import pandas as pd
 import time
+import unicodedata  # <--- Adicionado para normalização de texto
 
 # Configuração de Pastas
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,10 +15,62 @@ REFS_DIR = os.path.join(BASE_DIR, 'data', 'refs')
 if not os.path.exists(REFS_DIR):
     os.makedirs(REFS_DIR)
 
-print("🚀 Iniciando download e criação de tabelas de referência (Versão Corrigida)...")
+print("🚀 Iniciando criação de tabelas de referência (Completo + Tabela Mãe)...")
+
+def normalize(text):
+    """Remove acentos e caracteres especiais para garantir o cruzamento (Join)"""
+    if not isinstance(text, str): return str(text)
+    return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8').lower().strip()
 
 # ==============================================================================
-# 1. TABELA DE MUNICÍPIOS E UF (Fonte: API IBGE V1)
+# 1. TABELA MÃE DE SETORES (A Lógica Nova de Agrupamento)
+# ==============================================================================
+print("📋 Gerando Tabela Mãe de Setores Econômicos (Agrupamento)...")
+
+# Mapeamento Oficial: Nome da Seção no Arquivo -> Atividade Econômica Resumida
+dados_secoes = [
+    # AGRICULTURA
+    {"secao_nome": "AGRICULTURA, PECUÁRIA, PRODUÇÃO FLORESTAL, PESCA E AQÜICULTURA", "atividade_economica": "Agropecuária"},
+    
+    # INDÚSTRIA
+    {"secao_nome": "INDÚSTRIAS EXTRATIVAS", "atividade_economica": "Indústria"},
+    {"secao_nome": "INDÚSTRIAS DE TRANSFORMAÇÃO", "atividade_economica": "Indústria"},
+    {"secao_nome": "ELETRICIDADE E GÁS", "atividade_economica": "Indústria"},
+    {"secao_nome": "ÁGUA, ESGOTO, ATIVIDADES DE GESTÃO DE RESÍDUOS E DESCONTAMINAÇÃO", "atividade_economica": "Indústria"},
+    
+    # CONSTRUÇÃO
+    {"secao_nome": "CONSTRUÇÃO", "atividade_economica": "Construção"},
+    
+    # COMÉRCIO
+    {"secao_nome": "COMÉRCIO; REPARAÇÃO DE VEÍCULOS AUTOMOTORES E MOTOCICLETAS", "atividade_economica": "Comércio"},
+    
+    # SERVIÇOS (Todas as outras)
+    {"secao_nome": "TRANSPORTE, ARMAZENAGEM E CORREIO", "atividade_economica": "Serviços"},
+    {"secao_nome": "ALOJAMENTO E ALIMENTAÇÃO", "atividade_economica": "Serviços"},
+    {"secao_nome": "INFORMAÇÃO E COMUNICAÇÃO", "atividade_economica": "Serviços"},
+    {"secao_nome": "ATIVIDADES FINANCEIRAS, DE SEGUROS E SERVIÇOS RELACIONADOS", "atividade_economica": "Serviços"},
+    {"secao_nome": "ATIVIDADES IMOBILIÁRIAS", "atividade_economica": "Serviços"},
+    {"secao_nome": "ATIVIDADES PROFISSIONAIS, CIENTÍFICAS E TÉCNICAS", "atividade_economica": "Serviços"},
+    {"secao_nome": "ATIVIDADES ADMINISTRATIVAS E SERVIÇOS COMPLEMENTARES", "atividade_economica": "Serviços"},
+    {"secao_nome": "ADMINISTRAÇÃO PÚBLICA, DEFESA E SEGURIDADE SOCIAL", "atividade_economica": "Serviços"},
+    {"secao_nome": "EDUCAÇÃO", "atividade_economica": "Serviços"},
+    {"secao_nome": "SAÚDE HUMANA E SERVIÇOS SOCIAIS", "atividade_economica": "Serviços"},
+    {"secao_nome": "ARTES, CULTURA, ESPORTE E RECREAÇÃO", "atividade_economica": "Serviços"},
+    {"secao_nome": "OUTRAS ATIVIDADES DE SERVIÇOS", "atividade_economica": "Serviços"},
+    {"secao_nome": "SERVIÇOS DOMÉSTICOS", "atividade_economica": "Serviços"},
+    {"secao_nome": "ORGANISMOS INTERNACIONAIS E OUTRAS INSTITUIÇÕES EXTRATERRITORIAIS", "atividade_economica": "Serviços"},
+    {"secao_nome": "NÃO IDENTIFICADO", "atividade_economica": "Não Identificado"}
+]
+
+df_secoes = pd.DataFrame(dados_secoes)
+# Cria chave normalizada para o Join funcionar independente de maiúsculas/acentos
+df_secoes['match_key'] = df_secoes['secao_nome'].apply(normalize)
+df_secoes.to_csv(os.path.join(REFS_DIR, 'secoes.csv'), sep=';', index=False)
+print("✅ Tabela 'secoes.csv' criada com sucesso.")
+
+
+# ==============================================================================
+# 2. TABELA DE MUNICÍPIOS E UF (Fonte: API IBGE V1)
 # ==============================================================================
 print("⬇️ Baixando Municípios do IBGE...")
 url_mun = "https://servicodados.ibge.gov.br/api/v1/localidades/municipios"
@@ -25,20 +78,16 @@ url_mun = "https://servicodados.ibge.gov.br/api/v1/localidades/municipios"
 try:
     response = requests.get(url_mun)
     data = response.json()
-    
     lista_mun = []
     
     if isinstance(data, list):
         for item in data:
             try:
-                # Navegação segura para evitar erro 'NoneType'
                 micro = item.get('microrregiao', {})
                 meso = micro.get('mesorregiao', {}) if micro else {}
                 uf = meso.get('UF', {}) if meso else {}
                 
-                # Fallback: Se a estrutura hierárquica falhar, tenta pegar UF direto (alguns endpoints retornam diferente)
                 if not uf and 'microrregiao' in item and 'UF' in item['microrregiao']: 
-                     # Tentativa alternativa de estrutura
                      uf = item['microrregiao']['UF']
 
                 if uf:
@@ -49,16 +98,10 @@ try:
                         'uf_sigla': uf.get('sigla', '')
                     })
             except Exception as e_item:
-                print(f"⚠️ Aviso: Falha ao ler município {item.get('nome', '?')}: {e_item}")
                 continue
 
-        # Criação do DataFrame
         df_mun = pd.DataFrame(lista_mun)
-        
-        # Cria coluna de 6 dígitos (sem dígito verificador) para facilitar Joins
         df_mun['municipio_codigo_6'] = df_mun['municipio_codigo'].astype(str).str.slice(0, 6).astype(int)
-        
-        # Filtra apenas os válidos (UF > 0)
         df_mun = df_mun[df_mun['uf_codigo'] > 0]
         
         path_mun = os.path.join(REFS_DIR, 'municipios.csv')
@@ -66,27 +109,24 @@ try:
         print(f"✅ Tabela 'municipios.csv' criada com {len(df_mun)} cidades.")
     else:
         print("❌ Erro: API do IBGE não retornou uma lista.")
-
 except Exception as e:
     print(f"❌ Erro crítico ao baixar Municípios: {e}")
 
+
 # ==============================================================================
-# 2. TABELA CNAE (Subclasses e Seções) (Fonte: API IBGE V2)
+# 3. TABELA CNAE (Subclasses e Seções) (Fonte: API IBGE V2)
 # ==============================================================================
 print("⬇️ Baixando CNAE Subclasses (Isso pode demorar uns 30 segundos)...")
-# Nota: Baixar TODAS as subclasses é pesado. Vamos tentar a lista completa.
 url_cnae = "https://servicodados.ibge.gov.br/api/v2/cnae/subclasses"
 
 try:
     response = requests.get(url_cnae)
     data_cnae = response.json()
-    
     lista_cnae = []
     
     if isinstance(data_cnae, list):
         for item in data_cnae:
             try:
-                # Estrutura V2 é profunda: Classe -> Grupo -> Divisão -> Seção
                 classe = item.get('classe', {})
                 grupo = classe.get('grupo', {})
                 divisao = grupo.get('divisao', {})
@@ -97,10 +137,10 @@ try:
                 lista_cnae.append({
                     'subclasse_codigo': int(cnae_limpo),
                     'subclasse_descricao': item['descricao'],
-                    'secao_codigo': secao.get('id', ''),          # A, B, C...
-                    'secao_descricao': secao.get('descricao', '') # Agricultura, Indústria...
+                    'secao_codigo': secao.get('id', ''),
+                    'secao_descricao': secao.get('descricao', '')
                 })
-            except Exception as e_cnae:
+            except Exception:
                 continue
         
         df_cnae = pd.DataFrame(lista_cnae)
@@ -109,12 +149,12 @@ try:
         print(f"✅ Tabela 'cnae.csv' criada com {len(df_cnae)} atividades.")
     else:
         print(f"❌ Erro: API CNAE retornou formato inesperado.")
-
 except Exception as e:
     print(f"❌ Erro crítico ao baixar CNAE: {e}")
 
+
 # ==============================================================================
-# 3. TABELAS FIXAS DO CAGED (Manuais)
+# 4. TABELAS FIXAS DO CAGED (Manuais)
 # ==============================================================================
 print("⚙️ Gerando tabelas manuais (Instrução, Categoria, Sexo, Raça)...")
 
@@ -135,7 +175,7 @@ instrucao_data = [
 ]
 pd.DataFrame(instrucao_data).to_csv(os.path.join(REFS_DIR, 'grau_instrucao.csv'), sep=';', index=False)
 
-# Categoria (Tipo de emprego)
+# Categoria
 categoria_data = [
     { 'codigo': 101, 'descricao': 'Empregado - Geral' },
     { 'codigo': 102, 'descricao': 'Empregado - Rural' },
@@ -149,7 +189,7 @@ categoria_data = [
 ]
 pd.DataFrame(categoria_data).to_csv(os.path.join(REFS_DIR, 'categoria.csv'), sep=';', index=False)
 
-# Tipo Movimentação (Expandido)
+# Tipo Movimentação
 movimentacao_data = [
     { 'codigo': 10, 'descricao': 'Admissão por Primeiro Emprego' },
     { 'codigo': 20, 'descricao': 'Admissão por Reemprego' },
@@ -168,4 +208,4 @@ movimentacao_data = [
 ]
 pd.DataFrame(movimentacao_data).to_csv(os.path.join(REFS_DIR, 'tipo_movimentacao.csv'), sep=';', index=False)
 
-print("✅ Setup concluído! Tabelas geradas em 'data/refs'.")
+print("✅ Setup concluído com sucesso!")

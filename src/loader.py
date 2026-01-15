@@ -1,7 +1,8 @@
 import os
-import pandas as pd
-from sqlalchemy import create_engine, text, inspect
+import polars as pl
 import logging
+from sqlalchemy import create_engine, text, inspect
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -11,33 +12,7 @@ except ImportError:
     from src.config import PROCESSED_DIR, DB_URL, TABLE_NAME
 
 def get_db_engine():
-    # Adicionamos future=True para garantir compatibilidade moderna, se necessário
     return create_engine(os.getenv('AIRFLOW__DATABASE__SQL_ALCHEMY_CONN', DB_URL), future=True)
-
-def create_performance_indexes(engine):
-    """
-    Cria índices no banco de dados para garantir que os dashboards
-    de Botucatu e região carreguem em milissegundos.
-    """
-    logger.info("⚡ Otimizando banco de dados (Criando Índices)...")
-    
-    indexes = [
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_municipio ON {TABLE_NAME} (municipio_codigo);",
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_data ON {TABLE_NAME} (competencia_declarada);",
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_mun_data ON {TABLE_NAME} (municipio_codigo, competencia_declarada);",
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_setor ON {TABLE_NAME} (subclasse_codigo);",
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_saldo ON {TABLE_NAME} (saldo_movimentacao);"
-    ]
-
-    try:
-        # CORREÇÃO AQUI: Usamos engine.begin() para transação automática
-        with engine.begin() as conn:
-            for sql in indexes:
-                conn.execute(text(sql))
-            # O commit ocorre automaticamente ao sair do bloco 'with'
-        logger.info("⚡ Índices criados/verificados com sucesso!")
-    except Exception as e:
-        logger.warning(f"⚠️ Aviso: Não foi possível criar índices (pode ser permissão ou já existem): {e}")
 
 def load_to_database(csv_filename: str):
     csv_path = os.path.join(PROCESSED_DIR, csv_filename)
@@ -45,41 +20,92 @@ def load_to_database(csv_filename: str):
         logger.error(f"❌ Arquivo não encontrado: {csv_path}")
         return False
 
-    logger.info(f"📥 Iniciando carga de {csv_filename}...")
+    logger.info(f"📥 Iniciando Loader Inteligente para {csv_filename}...")
+    
     try:
         engine = get_db_engine()
-        df_header = pd.read_csv(csv_path, sep=';', nrows=1)
         
-        if 'competencia_declarada' not in df_header.columns:
-            raise Exception("CSV inválido: falta coluna 'competencia_declarada'.")
+        # 1. Analisa o CSV (cabeçalho)
+        df_head = pl.read_csv(csv_path, separator=';', n_rows=1, ignore_errors=True)
+        csv_columns = sorted(df_head.columns)
+        
+        if 'competencia_declarada' not in df_head.columns:
+             raise Exception("CSV inválido: Faltando coluna competencia_declarada")
+        
+        data_ref = df_head['competencia_declarada'][0]
+
+        with engine.begin() as conn:
+            inspector = inspect(engine)
             
-        data_ref = df_header['competencia_declarada'].iloc[0]
+            # 2. Verifica se a tabela existe e se a ESTRUTURA mudou
+            if inspector.has_table(TABLE_NAME):
+                db_columns = sorted([c['name'] for c in inspector.get_columns(TABLE_NAME)])
+                
+                # COMPARAÇÃO INTELIGENTE DE COLUNAS
+                if csv_columns != db_columns:
+                    logger.warning("⚠️ MUDANÇA DE ESTRUTURA DETECTADA!")
+                    logger.warning(f"CSV: {csv_columns}")
+                    logger.warning(f"DB:  {db_columns}")
+                    logger.warning("🧨 Executando DROP TABLE automático para recriar estrutura correta...")
+                    conn.execute(text(f"DROP TABLE {TABLE_NAME}"))
+                    table_exists = False
+                else:
+                    logger.info("✅ Estrutura da tabela está correta.")
+                    logger.info(f"🔄 Limpando dados do mês {data_ref} para evitar duplicidade...")
+                    conn.execute(text(f"DELETE FROM {TABLE_NAME} WHERE competencia_declarada = :d"), {"d": data_ref})
+                    table_exists = True
+            else:
+                table_exists = False
+            
+            # 3. Se tabela não existe (ou foi dropada), cria a casca
+            if not table_exists:
+                logger.info(f"🆕 Criando tabela '{TABLE_NAME}' baseada no CSV...")
+                # Lê amostra maior para o Pandas inferir tipos (int vs text)
+                df_sample = pd.read_csv(csv_path, sep=';', nrows=1000)
+                df_sample.head(0).to_sql(TABLE_NAME, engine, if_exists='replace', index=False)
+                logger.info("✅ Tabela criada com sucesso.")
+
+        # 4. Carga TURBO (COPY)
+        logger.info("🚀 Executando COPY stream (Alta Performance)...")
+        raw_conn = engine.raw_connection()
+        try:
+            with raw_conn.cursor() as cursor:
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    cursor.copy_expert(
+                        sql=f"COPY {TABLE_NAME} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ';', NULL '')",
+                        file=f
+                    )
+            raw_conn.commit()
+            logger.info(f"✅ Dados carregados com sucesso!")
+        finally:
+            raw_conn.close()
+
+        # 5. Índices (Performance para o Dashboard)
+        with engine.begin() as conn:
+            logger.info("⚡ Otimizando Índices...")
+            
+            # Recarrega colunas para garantir que o índice seja criado no campo certo
+            inspector = inspect(engine)
+            existing_columns = [c['name'] for c in inspector.get_columns(TABLE_NAME)]
+            
+            cmds = [
+                f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_data ON {TABLE_NAME} (competencia_declarada);",
+                f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_muni ON {TABLE_NAME} (municipio_codigo);"
+            ]
+            
+            # Índice Flexível (Cria no que estiver disponível)
+            if 'secao_descricao' in existing_columns:
+                cmds.append(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_setor ON {TABLE_NAME} (secao_descricao);")
+            elif 'secao_nome' in existing_columns:
+                cmds.append(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_setor_raw ON {TABLE_NAME} (secao_nome);")
+            
+            if 'atividade_economica' in existing_columns:
+                cmds.append(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_atividade ON {TABLE_NAME} (atividade_economica);")
+
+            for cmd in cmds:
+                try: conn.execute(text(cmd))
+                except: pass
         
-        # VERIFICAÇÃO DE TABELA
-        inspector = inspect(engine)
-        if inspector.has_table(TABLE_NAME):
-            logger.info(f"🔄 Limpando dados antigos de {data_ref}...")
-            # CORREÇÃO AQUI: Usamos engine.begin() e removemos o conn.commit() manual
-            with engine.begin() as conn:
-                conn.execute(text(f"DELETE FROM {TABLE_NAME} WHERE competencia_declarada = :d"), {"d": data_ref})
-        else:
-            logger.info(f"🆕 Tabela '{TABLE_NAME}' será criada agora.")
-
-        chunk_size = 2000
-        total_rows = 0
-        for chunk in pd.read_csv(csv_path, sep=';', chunksize=chunk_size):
-            chunk.columns = [c.lower() for c in chunk.columns]
-            chunk.to_sql(name=TABLE_NAME, con=engine, if_exists='append', index=False, method='multi')
-            total_rows += len(chunk)
-            if total_rows % 20000 == 0: logger.info(f"   -> {total_rows} linhas...")
-
-        logger.info(f"✅ Carga concluída! Total: {total_rows}")
-        
-        # --- ETAPA FINAL: OTIMIZAÇÃO ---
-        create_performance_indexes(engine)
-        # -------------------------------
-
-        with open(csv_path.replace('.csv', '_REPORT.txt'), 'w') as f: f.write(f"OK: {total_rows}")
         return True
 
     except Exception as e:

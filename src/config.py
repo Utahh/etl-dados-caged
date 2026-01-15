@@ -1,71 +1,89 @@
 import os
 
-# --- 1. Configuração de Caminhos ---
-IS_DOCKER = os.path.exists('/.dockerenv') or os.getenv('AIRFLOW_HOME') is not None
-BASE_PATH = '/opt/airflow' if IS_DOCKER else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# --- DIRETÓRIOS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.basename(BASE_DIR) == 'src':
+    BASE_DIR = os.path.dirname(BASE_DIR)
 
-DATA_DIR = os.path.join(BASE_PATH, 'data')
-RAW_DIR = os.path.join(DATA_DIR, 'raw')
-RAW_ZIP_DIR = os.path.join(RAW_DIR, 'zip')
-RAW_EXTRACT_DIR = os.path.join(RAW_DIR, 'extracted')
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+RAW_ZIP_DIR = os.path.join(DATA_DIR, 'raw', 'zip')
+RAW_EXTRACT_DIR = os.path.join(DATA_DIR, 'raw', 'extracted')
 PROCESSED_DIR = os.path.join(DATA_DIR, 'processed')
 REFS_DIR = os.path.join(DATA_DIR, 'refs')
 
-os.makedirs(RAW_ZIP_DIR, exist_ok=True)
-os.makedirs(RAW_EXTRACT_DIR, exist_ok=True)
-os.makedirs(PROCESSED_DIR, exist_ok=True)
-
-# --- 2. Configurações do FTP ---
-FTP_HOST = 'ftp.mtps.gov.br'
-FTP_BASE_PATH = '/pdet/microdados/NOVO CAGED/'
+# --- CONFIGURAÇÕES FTP ---
+FTP_HOST = "ftp.mtps.gov.br"
+FTP_BASE_PATH = "/pdet/microdados/NOVO CAGED/"
 MAX_HISTORY_FILES = 3
 
-# --- 3. Configuração do Banco de Dados ---
-DB_URL = os.getenv('DB_URL', 'postgresql+psycopg2://airflow:airflow@postgres/airflow')
-TABLE_NAME = 'caged_sp_novo'
+# --- FILTROS ---
+UF_FILTER = 35  # São Paulo (None para processar tudo)
 
-# --- 4. Filtros e Mapeamentos ---
-UF_FILTER = 35  # São Paulo
+# --- BANCO DE DADOS ---
+# Se estiver rodando dentro do Docker (Airflow), usa o service name 'postgres'
+# Se for rodar localmente para testes, use 'localhost'
+DB_HOST = "postgres" 
+DB_PORT = "5432"
+DB_NAME = "airflow"
+DB_USER = "airflow"
+DB_PASS = "airflow"
+TABLE_NAME = "caged_sp_novo"
 
-# MAPA BLINDADO: Inclui nomes originais, técnicos e versões CORROMPIDAS comuns
+# URL de Conexão SQLAlchemy
+DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# --- MAPEAMENTO DE COLUNAS (CRUCIAL) ---
+# A chave (esquerda) é como vem no arquivo TXT/CSV do governo.
+# O valor (direita) é como será salvo no seu Banco de Dados.
 COLUMNS_MAP = {
     # --- MUNICÍPIO ---
     'município': 'municipio_codigo',
     'municipio_codigo': 'municipio_codigo',
-    'municapio': 'municipio_codigo',   # <--- Do seu log
+    'municapio': 'municipio_codigo',
     'municipio': 'municipio_codigo',
 
-    # --- ATIVIDADE (CNAE/SEÇÃO) ---
+    # --- SEÇÃO / SETOR (Onde estava o problema) ---
+    # Adicionamos todas as variações possíveis para garantir que ele pegue
+    'seção': 'secao_descricao',
+    'secao': 'secao_descricao',
+    'secao_codigo': 'secao_codigo', # Código (A, B, C...)
+    
+    'secao_nome': 'secao_descricao',       # Nome padrão (INDÚSTRIA...)
+    'seção_nome': 'secao_descricao',       # Com acento
+    'seçao_nome': 'secao_descricao',       # Erro comum
+    'seaaonome': 'secao_descricao',        # Erro de encoding comum
+    'secao_descricao': 'secao_descricao',
+
+    # --- SUBCLASSE (Atividade Específica) ---
     'subclasse': 'subclasse_codigo',
     'subclasse_codigo': 'subclasse_codigo',
-    'seção': 'secao_codigo',
-    'secao_codigo': 'secao_codigo',
-    'seaao': 'secao_codigo',           # <--- Do seu log
-    'secao': 'secao_codigo',
+    'subclasse_descricao': 'subclasse_descricao',
+    'subclasse_desc': 'subclasse_descricao',
+    'subclassedescricao': 'subclasse_descricao',
 
     # --- MOVIMENTAÇÃO E SALDO ---
     'competênciamov': 'competencia_mov',
     'competencia_mov': 'competencia_mov',
-    'competaanciamov': 'competencia_mov', # <--- Do seu log
+    'competaanciamov': 'competencia_mov',
     
     'saldo': 'saldo_movimentacao',
     'saldo_movimentacao': 'saldo_movimentacao',
-    'saldomovimentaaao': 'saldo_movimentacao', # <--- Do seu log
+    'saldomovimentaaao': 'saldo_movimentacao',
     
     'tipomovimentação': 'tipo_movimentacao',
     'tipo_movimentacao_codigo': 'tipo_movimentacao',
-    'tipomovimentaaao': 'tipo_movimentacao',   # <--- Do seu log
+    'tipomovimentaaao': 'tipo_movimentacao',
 
     # --- SALÁRIO ---
     'salário': 'salario',
     'salario': 'salario',
     'valorsaláriofixo': 'salario',
-    'valorsalariofixo': 'salario',     # <--- Do seu log
+    'valorsalariofixo': 'salario',
 
     # --- DADOS DEMOGRÁFICOS ---
     'raçacor': 'raca_cor',
     'raca_cor_codigo': 'raca_cor',
-    'raaacor': 'raca_cor',             # <--- Do seu log
+    'raaacor': 'raca_cor',
     
     'sexo': 'sexo',
     'sexo_codigo': 'sexo',
@@ -74,18 +92,19 @@ COLUMNS_MAP = {
     
     'graudeinstrução': 'grau_instrucao',
     'grau_instrucao_codigo': 'grau_instrucao',
-    'graudeinstruaao': 'grau_instrucao', # <--- Do seu log
+    'graudeinstruaao': 'grau_instrucao',
 
     # --- OUTROS ---
     'cbo2002ocupação': 'cbo2002',
-    'cbo2002ocupaaao': 'cbo2002',       # <--- Do seu log
+    'cbo2002ocupaaao': 'cbo2002',
+    'cbo2002': 'cbo2002',
     'categoria': 'categoria',
-    'categoria_codigo': 'categoria',
     'horascontratuais': 'horas_contratuais',
     'tipoempregador': 'tipo_empregador',
     'tipoestabelecimento': 'tipo_estabelecimento',
     'indtrabalhointermitente': 'ind_trabalho_intermitente',
-    'indtrabintermitente': 'ind_trabalho_intermitente', # <--- Do seu log
     'indtrabalhoparcial': 'ind_trabalho_parcial',
-    'indtrabparcial': 'ind_trabalho_parcial'            # <--- Do seu log
+    
+    # --- CAMPO NOVO (Gerado pelo Python) ---
+    'atividade_economica': 'atividade_economica'
 }
