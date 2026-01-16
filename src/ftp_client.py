@@ -1,106 +1,89 @@
-import os
 import ftplib
+import os
 import logging
-from .config import FTP_HOST, FTP_BASE_PATH, RAW_ZIP_DIR, MAX_HISTORY_FILES
 
 logger = logging.getLogger(__name__)
 
+# Importação Limpa (Sem variáveis desnecessárias)
+try:
+    from .config import FTP_HOST
+except ImportError:
+    from src.config import FTP_HOST
+
 class FTPClient:
-    def _connect(self):
-        ftp = ftplib.FTP(FTP_HOST)
-        # Força Latin-1 para aceitar acentos do governo
-        ftp.encoding = 'latin-1' 
-        ftp.login()
-        return ftp
+    def __init__(self, host, user='anonymous', passwd=''):
+        self.host = host
+        self.user = user
+        self.passwd = passwd
+        self.ftp = None
 
-    def get_available_periods(self, limit=3):
-        ftp = self._connect()
-        logger.info("📡 Sondando FTP por dados disponíveis...")
-        available_periods = []
+    def connect(self):
         try:
-            ftp.cwd(FTP_BASE_PATH)
-            years = [y for y in ftp.nlst() if y.isdigit() and len(y) == 4]
-            years.sort(reverse=True)
-            
-            for year in years:
-                if len(available_periods) >= limit: break
-                try:
-                    ftp.cwd(f"{FTP_BASE_PATH}/{year}")
-                    items = ftp.nlst()
-                    months_found = []
-                    for item in items:
-                        if item.isdigit() and len(item) == 6 and item.startswith(year):
-                            months_found.append(item[4:6])
-                    months_found.sort(reverse=True)
-                    for m in months_found:
-                        available_periods.append((year, m))
-                        if len(available_periods) >= limit: break
-                except: continue
+            self.ftp = ftplib.FTP(self.host)
+            self.ftp.login(self.user, self.passwd)
+            self.ftp.encoding = 'latin-1' 
+            return True
         except Exception as e:
-            logger.error(f"❌ Erro ao sondar FTP: {e}")
-        finally:
-            ftp.quit()
-        logger.info(f"📅 Períodos encontrados: {available_periods}")
-        return available_periods
+            logger.error(f"❌ Erro ao conectar no FTP ({self.host}): {e}")
+            raise e
 
-    def download_caged(self, year: str, month: str):
-        filename = f"CAGEDMOV{year}{month}.7z"
-        local_path = os.path.join(RAW_ZIP_DIR, filename)
+    def close(self):
+        if self.ftp:
+            try: self.ftp.quit()
+            except: pass
+
+    def download_file(self, remote_path, filename, local_dir):
+        """
+        Baixa um arquivo específico.
+        Retorna o caminho local se sucesso, ou None se falhar.
+        """
+        local_path = os.path.join(local_dir, filename)
         
-        # --- NOVO: Verificação de Integridade ---
-        if os.path.exists(local_path):
-            file_size = os.path.getsize(local_path)
-            if file_size > 0:
-                logger.info(f"ℹ️ Arquivo {filename} já existe ({file_size/1024:.2f} KB). Pulando download.")
-                return local_path
-            else:
-                logger.warning(f"⚠️ Arquivo {filename} existe mas está VAZIO (0 bytes). Removendo para baixar de novo.")
-                os.remove(local_path)
-        # ----------------------------------------
-
-        # Limpeza de histórico
         try:
-            files = sorted(
-                [os.path.join(RAW_ZIP_DIR, f) for f in os.listdir(RAW_ZIP_DIR)],
-                key=os.path.getmtime
-            )
-            while len(files) >= MAX_HISTORY_FILES:
-                oldest = files.pop(0)
-                os.remove(oldest)
-        except Exception: pass
-
-        # Download
-        ftp = self._connect()
-        try:
-            paths_to_try = [
-                f"{FTP_BASE_PATH}/{year}/{year}{month}",
-                f"{FTP_BASE_PATH}/{year}"
-            ]
-            success = False
-            for path in paths_to_try:
-                try:
-                    ftp.cwd(path)
-                    logger.info(f"⬇️ Baixando {filename} de {path}...")
-                    with open(local_path, 'wb') as f:
-                        ftp.retrbinary(f"RETR {filename}", f.write)
-                    
-                    # Verifica se baixou algo
-                    if os.path.getsize(local_path) > 0:
-                        success = True
-                        break
-                except: continue
-            
-            if success:
-                logger.info("✅ Download concluído!")
-                return local_path
-            else:
-                logger.error(f"❌ Arquivo {filename} não encontrado no FTP.")
-                if os.path.exists(local_path): os.remove(local_path) # Limpa lixo
+            # 1. Tenta entrar na pasta remota
+            try:
+                self.ftp.cwd(remote_path)
+            except ftplib.error_perm:
+                logger.warning(f"⚠️ A pasta '{remote_path}' não existe no servidor.")
                 return None
             
+            # 2. Verifica se o arquivo existe na lista
+            try:
+                files_on_server = self.ftp.nlst()
+            except ftplib.error_perm:
+                files_on_server = []
+
+            if filename not in files_on_server:
+                logger.warning(f"⏳ Arquivo '{filename}' não encontrado em '{remote_path}'.")
+                return None
+
+            # 3. Verifica tamanho (evitar download repetido)
+            try:
+                remote_size = self.ftp.size(filename)
+            except: 
+                remote_size = -1
+
+            if os.path.exists(local_path):
+                local_size = os.path.getsize(local_path)
+                if remote_size != -1 and local_size == remote_size:
+                    logger.info(f"ℹ️ Arquivo {filename} já existe e está íntegro. Pulando.")
+                    return local_path
+
+            # 4. Download
+            logger.info(f"⬇️ Baixando {filename}...")
+            with open(local_path, 'wb') as f:
+                self.ftp.retrbinary(f"RETR {filename}", f.write)
+            
+            logger.info(f"✅ Download concluído: {local_path}")
+            return local_path
+
+        except ftplib.error_perm as e:
+            if "550" in str(e):
+                logger.warning(f"⏳ Arquivo não encontrado (Erro 550).")
+                return None
+            else:
+                logger.error(f"❌ Erro de permissão FTP: {e}")
+                raise e
         except Exception as e:
-            logger.error(f"❌ Erro crítico FTP: {e}")
-            if os.path.exists(local_path): os.remove(local_path)
-            return None
-        finally:
-            ftp.quit()
+            logger.error(f"❌ Erro genérico no download: {e}")
+            raise e

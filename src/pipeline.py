@@ -1,64 +1,88 @@
 import os
 import logging
-import argparse
+import gc
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 try:
+    from .config import RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH
     from .ftp_client import FTPClient
     from .processor import CagedProcessor
     from .loader import load_to_database
-    from .config import REFS_DIR
 except ImportError:
+    from src.config import RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH
     from src.ftp_client import FTPClient
     from src.processor import CagedProcessor
     from src.loader import load_to_database
-    from src.config import REFS_DIR
 
-def check_setup():
-    required = ['municipios.csv', 'cnae.csv']
-    missing = [f for f in required if not os.path.exists(os.path.join(REFS_DIR, f))]
-    if missing:
-        logger.warning(f"⚠️ Faltam arquivos de referência: {missing} (Joins podem falhar)")
-    return True
-
-def run_pipeline(year: str, month: str):
+def run_pipeline(year: str, month: str, force_download=False):
+    """
+    Executa o pipeline ETL completo.
+    """
+    filename = f"CAGEDMOV{year}{month}.7z"
     logger.info(f"=== 🏁 INICIANDO PIPELINE CAGED (SRC): {month}/{year} ===")
-    check_setup()
-    txt_path = None
+
+    ftp = FTPClient(FTP_HOST)
+    processor = CagedProcessor()
     
     try:
-        # 1. Extract
+        # 1. Extração
         logger.info("[1/3] Extração (Download FTP)...")
-        ftp = FTPClient()
-        zip_path = ftp.download_caged(year, month)
-        if not zip_path: return
-
-        # 2. Transform
-        logger.info("[2/3] Transformação (ETL + Join)...")
-        processor = CagedProcessor()
-        txt_path = processor.extract_file(zip_path)
-        if not txt_path: return
+        ftp.connect()
         
-        csv_filename = f"CAGED_SP_{year}_{month.zfill(2)}.csv"
-        processor.process_data(txt_path, csv_filename, year, month)
+        folder_month = f"{year}{month}"
+        remote_path = f"{FTP_BASE_PATH}{year}/{folder_month}/"
+        
+        zip_path = ftp.download_file(remote_path, filename, RAW_ZIP_DIR)
+        ftp.close()
 
-        # 3. Load
+        if zip_path is None:
+            logger.warning(f"⚠️ PIPELINE INTERROMPIDO: Arquivo não encontrado.")
+            return 
+
+        # 2. Transformação
+        logger.info("[2/3] Transformação (ETL + Join)...")
+        txt_path = processor.extract_file(zip_path)
+        
+        if not txt_path:
+            raise Exception("Falha na extração do 7z.")
+
+        csv_filename = f"CAGED_SP_{year}_{month}.csv"
+        
+        # O process_data retorna o CAMINHO COMPLETO do CSV gerado
+        final_csv_path = processor.process_data(txt_path, csv_filename, year, month)
+
+        # 3. Carga
         logger.info("[3/3] Carga (Banco de Dados)...")
-        load_to_database(csv_filename)
-        logger.info(f"=== ✨ SUCESSO! Dados de {month}/{year} carregados. ===")
+        
+        # --- CORREÇÃO AQUI: Passa o caminho completo, não só o nome ---
+        if load_to_database(final_csv_path):
+            logger.info(f"=== ✨ SUCESSO! Dados de {month}/{year} carregados. ===")
+        else:
+            logger.error("❌ Falha na carga do banco.")
+            raise Exception("Erro no Loader.")
+        # --------------------------------------------------------------
+
+        # Limpeza
+        logger.info("🧹 Limpando arquivos temporários...")
+        try:
+            if os.path.exists(txt_path): os.remove(txt_path)
+            path_utf8 = txt_path + ".utf8"
+            if os.path.exists(path_utf8): os.remove(path_utf8)
+        except: pass
 
     except Exception as e:
-        logger.error(f"🔥 Ocorreu um erro não tratado no pipeline: {e}")
+        logger.error(f"🔥 Erro no Pipeline: {e}")
         raise e
     finally:
-        logger.info("🧹 Executando limpeza de temporários...")
-        if txt_path and os.path.exists(txt_path):
-            try: os.remove(txt_path)
-            except: pass
+        if 'ftp' in locals(): ftp.close()
+        gc.collect() 
+        time.sleep(2)
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--year', type=str)
     parser.add_argument('--month', type=str)

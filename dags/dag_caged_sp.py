@@ -1,127 +1,98 @@
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
+import sys
+import os
+import logging
+from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models.param import Param
-import sys
-import gc   # <--- Importante para limpeza de memória
-import time # <--- Importante para o "respiro"
 
-# --- Configurações Padrão ---
-hoje = datetime.now()
-mes_passado = hoje.replace(day=1) - timedelta(days=1)
-default_ano = str(mes_passado.year)
-default_mes = str(mes_passado.month).zfill(2)
+# --- SETUP DE CAMINHOS ---
+dag_folder = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dag_folder)
+airflow_home = os.path.dirname(dag_folder)
+sys.path.append(airflow_home)
 
-default_args = {
+# --- CONFIGURAÇÃO DA DAG ---
+default_args_config = { 
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
     'retries': 0,
+}
+
+# Parâmetros
+params = {
+    "modo_execucao": Param("Automatico", enum=["Automatico", "Manual_Mes_Unico", "Manual_Periodo"], description="Modo de Execução"),
+    "ano_inicio": Param("", type=["string", "null"], description="[Manual] Ano (Ex: 2025)"),
+    "mes_inicio": Param("", type=["string", "null"], description="[Manual] Mês (Ex: 11)"),
+    "ano_fim": Param("", type=["string", "null"], description="[Periodo] Ano Final"),
+    "mes_fim": Param("", type=["string", "null"], description="[Periodo] Mês Final"),
 }
 
 with DAG(
     'dag_caged_sp_manual_v2',
-    default_args=default_args,
+    default_args=default_args_config, # <--- Está correto aqui. Pode ignorar o sublinhado do editor.
+    description='Pipeline CAGED SP (Automático 3 meses e Manual)',
     schedule_interval=None,
+    start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['caged', 'sp', 'etl', 'otimizado'],
-    params={
-        "modo_execucao": Param(
-            "Automático (Disponível no Governo)", 
-            type="string", 
-            enum=["Automático (Disponível no Governo)", "Manual (Mês Único)", "Manual (Período)"],
-            description="Automático: Varre o FTP e baixa os 3 últimos meses reais disponíveis."
-        ),
-        "ano_inicio": Param(default_ano, type=["string", "null"], description="Ano Início (Ignorar se Automático)"),
-        "mes_inicio": Param(default_mes, type=["string", "null"], description="Mês Início (Ignorar se Automático)"),
-        "ano_fim": Param(None, type=["string", "null"], description="Ano Fim (Apenas para Modo Período)"),
-        "mes_fim": Param(None, type=["string", "null"], description="Mês Fim (Apenas para Modo Período)"),
-    }
+    tags=['caged', 'sp', 'etl'],
+    params=params
 ) as dag:
 
     def task_wrapper(**kwargs):
-        if '/opt/airflow' not in sys.path:
-            sys.path.insert(0, '/opt/airflow')
-            
+        # Importação segura
         try:
             from src.pipeline import run_pipeline
             from src.ftp_client import FTPClient
+            from src.config import FTP_HOST
         except ImportError as e:
-            print(f"❌ Erro crítico de importação: {e}")
+            logging.error(f"⚠️ Erro de importação: {e}")
             raise e
 
-        # --- SETUP ---
+        # Captura parâmetros
         params = kwargs['params']
-        modo = params['modo_execucao']
+        modo = params.get('modo_execucao', 'Automatico')
+        
+        logging.info(f"⚙️ MODO SELECIONADO: {modo}")
+        
         lista_processamento = []
 
-        print(f"⚙️ MODO SELECIONADO: {modo}")
+        if modo == "Automatico":
+            logging.info("📅 Calculando os últimos 3 meses disponíveis...")
+            hoje = datetime.now()
+            data_base = hoje.replace(day=1)
+            
+            for i in range(2, 5): 
+                mes_anterior = (data_base.month - i - 1) % 12 + 1
+                ano_anterior = data_base.year + (data_base.month - i - 1) // 12
+                lista_processamento.append((str(ano_anterior), str(mes_anterior).zfill(2)))
+            
+            logging.info(f"🤖 Automático detectou: {lista_processamento}")
 
-        # --- DEFINIÇÃO DA LISTA DE TRABALHO ---
-        if modo == "Automático (Disponível no Governo)":
-            print("📡 Conectando ao FTP (Modo Seguro Latin-1)...")
-            try:
-                ftp = FTPClient()
-                lista_processamento = ftp.get_available_periods(limit=3)
-                if not lista_processamento:
-                    print("⚠️ Aviso: Nenhum período encontrado.")
-                else:
-                    lista_processamento.sort() # Ordena cronologicamente
-            except Exception as e:
-                print(f"❌ Erro FTP: {e}")
-                raise e
+        else:
+            ano_i = params.get('ano_inicio')
+            mes_i = params.get('mes_inicio')
+            
+            if not ano_i or not mes_i:
+                raise ValueError("⚠️ Para modo Manual, Ano e Mês de início são obrigatórios!")
 
-        elif modo == "Manual (Período)":
-            if not params['ano_fim'] or not params['mes_fim']:
-                raise ValueError("Preencha Ano/Mês Fim para período.")
-            try:
-                dt_inicio = datetime(int(params['ano_inicio']), int(params['mes_inicio']), 1)
-                dt_fim = datetime(int(params['ano_fim']), int(params['mes_fim']), 1)
-                if dt_fim < dt_inicio: raise ValueError("Data Fim menor que Início.")
-                curr = dt_inicio
-                while curr <= dt_fim:
-                    lista_processamento.append((str(curr.year), str(curr.month).zfill(2)))
-                    curr += relativedelta(months=1)
-            except Exception as e:
-                print(f"❌ Erro datas: {e}")
-                raise e
+            if modo == "Manual_Mes_Unico":
+                lista_processamento = [(ano_i, mes_i.zfill(2))]
+            elif modo == "Manual_Periodo":
+                lista_processamento = [(ano_i, mes_i.zfill(2))]
 
-        else: # Mês Único
-            lista_processamento.append((params['ano_inicio'], params['mes_inicio']))
+        if not lista_processamento:
+            logging.warning("⚠️ Nenhuma data para processar.")
+            return
 
-        # ======================================================================
-        # LOOP DE EXECUÇÃO OTIMIZADO (BATCH SAFE)
-        # ======================================================================
-        total = len(lista_processamento)
-        print(f"📋 Fila de Processamento: {lista_processamento}")
-        
         for idx, (ano, mes) in enumerate(lista_processamento):
-            print(f"\n▶️ [{idx+1}/{total}] Iniciando carga de: {mes}/{ano}...")
-            
-            start_time = time.time()
-            try:
-                # 1. Executa o Pipeline Pesado
-                run_pipeline(year=ano, month=mes)
-                
-            except Exception as e:
-                print(f"⚠️ Falha ao processar {mes}/{ano}: {e}")
-                # Continua para o próximo mesmo com erro
-            
-            finally:
-                # 2. ESTRATÉGIA ANTI-SOBRECARGA
-                duration = time.time() - start_time
-                print(f"⏱️ Duração da etapa: {duration:.2f} segundos.")
-                
-                print("🧹 Faxina: Liberando memória RAM (Garbage Collection)...")
-                gc.collect()  # Força limpeza da RAM
-                
-                print("💤 Respiro: Aguardando 5s para aliviar FTP e Banco...")
-                time.sleep(5) # Pausa para evitar rate-limit e baixar uso de CPU
-
-        print(f"\n🏁 Execução finalizada com sucesso.")
+            logging.info(f"\n▶️ [{idx+1}/{len(lista_processamento)}] Iniciando carga de: {mes}/{ano}...")
+            run_pipeline(ano, mes)
 
     run_task = PythonOperator(
         task_id='run_caged_pipeline_v2',
-        python_callable=task_wrapper
+        python_callable=task_wrapper,
+        provide_context=True
     )
