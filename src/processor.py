@@ -30,65 +30,85 @@ class CagedProcessor:
             return None
 
     def load_ref(self, key_name, col_cod, col_desc):
+        """Carrega CSV de referência e normaliza chaves."""
         path = REFS_FILES.get(key_name)
+        
         if path and not os.path.exists(path):
             alt = path.replace("municipios", "municípios").replace("secoes", "seções")
             if os.path.exists(alt): path = alt
             
-        if not path or not os.path.exists(path): return None
+        if not path or not os.path.exists(path):
+            logger.warning(f"⚠️ Ref '{key_name}' não encontrada.")
+            return None
 
         try:
             df = pl.read_csv(path, separator=';', infer_schema_length=0)
             df.columns = [c.lower().strip() for c in df.columns]
             
+            # Busca dinâmica: Verifica se o trecho (ex: 'codigo') existe no nome da coluna
             c_join = next((c for c in df.columns if col_cod in c), None)
             c_desc = next((c for c in df.columns if col_desc in c), None)
 
-            if not c_join or not c_desc: return None
+            if not c_join or not c_desc: 
+                logger.warning(f"⚠️ Colunas não encontradas em {key_name}. Procurando: {col_cod}, {col_desc}. Tem: {df.columns}")
+                return None
             
             df = df.select([
                 pl.col(c_join).cast(pl.Utf8).alias("ref_key"),
                 pl.col(c_desc).alias(f"{key_name}_desc")
             ])
+
             if key_name == "municipios":
                 df = df.with_columns(pl.col("ref_key").str.slice(0, 6))
+
             return df
-        except: return None
+        except Exception as e:
+            logger.error(f"❌ Erro lendo {key_name}: {e}")
+            return None
 
     def process_data(self, txt_path, csv_filename, year, month):
         logger.info(f"🔨 Processando: {txt_path}")
         try:
-            # 1. LEITURA E FILTRO IMEDIATO DE SP
+            # 1. LEITURA
             df = pl.scan_csv(txt_path, separator=';', encoding='utf8-lossy', infer_schema_length=0, null_values=['NA','nan','null',''])
             df = df.rename({c: c.lower().strip() for c in df.columns})
             
             if "uf" in df.columns: 
                 df = df.filter(pl.col("uf") == "35")
 
-            # Renomeia
             cols_to_rename = {k: v for k, v in self.column_mapping.items() if k in df.columns}
             df = df.rename(cols_to_rename)
             
-            # Traz SP para memória
             df_final = df.collect()
 
-            # --- CHECKPOINT 1: AUDITORIA INICIAL (SP BRUTO) ---
+            # --- CHECKPOINT 1: AUDITORIA SP BRUTO ---
             count_sp_raw = df_final.height
             logger.info(f"📊 [AUDITORIA] Qtd Registros SP (Antes do Tratamento): {count_sp_raw}")
-            # --------------------------------------------------
 
             # 2. ENRIQUECIMENTO (JOINS)
-            # Município
+            
+            # A) MUNICÍPIO
             ref_muni = self.load_ref("municipios", "codigo", "nome")
             if ref_muni is not None and "municipio_codigo" in df_final.columns:
                 df_final = df_final.with_columns(pl.col("municipio_codigo").str.slice(0, 6).alias("join_muni"))
                 df_final = df_final.join(ref_muni, left_on="join_muni", right_on="ref_key", how="left")
                 df_final = df_final.rename({"municipios_desc": "municipio_nome"})
 
-            # Demais Joins
+            # B) SEÇÃO (CORREÇÃO AQUI) -> Mudamos de "desc" para "atividade"
+            # O arquivo tem 'atividade_economica', então 'desc' não encontrava nada.
+            ref_secao = self.load_ref("secoes", "codigo", "atividade")
+            if ref_secao is not None:
+                df_final = df_final.join(ref_secao, left_on="secao_codigo", right_on="ref_key", how="left")
+                df_final = df_final.rename({"secoes_desc": "secao_nome"})
+
+            # C) SUBCLASSE
+            ref_sub = self.load_ref("subclasse", "subclasse", "desc")
+            if ref_sub is not None:
+                df_final = df_final.join(ref_sub, left_on="subclasse_codigo", right_on="ref_key", how="left")
+                df_final = df_final.rename({"subclasse_desc": "subclasse_descricao"})
+
+            # D) DEMAIS JOINS
             joins = [
-                ("secoes", "secao_codigo", "secoes_desc", "secao_nome", "codigo", "desc"),
-                ("subclasse", "subclasse_codigo", "subclasse_desc", "subclasse_descricao", "subclasse", "desc"),
                 ("categoria", "categoria_codigo", "categoria_desc", "categoria_desc", "codigo", "desc"),
                 ("grau_instrucao", "grau_instrucao_codigo", "grau_instrucao_desc", "grau_instrucao_desc", "codigo", "desc"),
                 ("tipo_movimentacao", "tipo_movimentacao_codigo", "tipo_movimentacao_desc", "tipo_movimentacao_desc", "codigo", "desc")
@@ -125,16 +145,14 @@ class CagedProcessor:
             existing = [c for c in final_cols if c in df_final.columns]
             df_final = df_final.select(existing)
 
-            # --- CHECKPOINT 2: AUDITORIA FINAL (PRONTO PARA BANCO) ---
+            # --- CHECKPOINT 2: AUDITORIA FINAL ---
             count_sp_final = df_final.height
-            logger.info(f"📊 [AUDITORIA] Qtd Registros SP (Após Tratamento/Joins): {count_sp_final}")
+            logger.info(f"📊 [AUDITORIA] Qtd Registros SP (Após Tratamento): {count_sp_final}")
             
-            diff = count_sp_final - count_sp_raw
-            if diff != 0:
-                logger.warning(f"⚠️ ATENÇÃO: Diferença de {diff} registros após Joins.")
+            if count_sp_final != count_sp_raw:
+                logger.warning(f"⚠️ Diferença de registros: {count_sp_final - count_sp_raw}")
             else:
-                logger.info("✅ Integridade OK: Quantidade inicial e final iguais.")
-            # ---------------------------------------------------------
+                logger.info("✅ Integridade OK.")
 
             output_path = os.path.join(PROCESSED_DIR, csv_filename)
             df_final.write_csv(output_path, separator=';')
