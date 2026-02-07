@@ -1,79 +1,57 @@
+import polars as pl
+import pandas as pd
+from sqlalchemy import create_engine, text
 import os
-import logging
-import psycopg2
-from sqlalchemy import create_engine
+from .config import DB_URL, TABLE_NAME
 
-try:
-    from .config import DB_URL, TABLE_NAME
-except ImportError:
-    from src.config import DB_URL, TABLE_NAME
-
-logger = logging.getLogger(__name__)
-
-def create_table_if_not_exists(conn):
-    # Nova estrutura baseada na sua solicitação
-    ddl = f"""
-    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-        uf_codigo INTEGER,
-        municipio_codigo INTEGER,
-        secao_codigo VARCHAR(5),
-        subclasse_codigo BIGINT,
-        saldo_movimentacao INTEGER,
-        categoria_codigo INTEGER,
-        grau_instrucao_codigo INTEGER,
-        idade INTEGER,
-        raca_cor_codigo INTEGER,
-        sexo_codigo INTEGER,
-        tipo_movimentacao_codigo INTEGER,
-        salario DECIMAL(12,2),
-        data_ref DATE,
-        data_proc DATE,
-        municipio_nome VARCHAR(255),
-        uf_sigla CHAR(2),
-        subclasse_descricao TEXT,
-        secao_nome VARCHAR(255),
-        grau_instrucao_desc VARCHAR(255),
-        categoria_desc VARCHAR(255),
-        tipo_movimentacao_desc VARCHAR(255),
-        sexo_descricao VARCHAR(50),
-        raca_cor_desc VARCHAR(50)
-    );
+def load_to_database(csv_source, data_ref_iso):
     """
+    Carrega os dados no PostgreSQL.
+    Usa Polars para leitura (rápido) e Pandas para escrita (compatível com Transação SQLAlchemy).
+    """
+    engine = create_engine(DB_URL)
+    
+    # 1. Leitura Rápida com Polars
+    if isinstance(csv_source, str):
+        print(f"📂 Lendo CSV com Polars: {csv_source}")
+        try:
+            # Tenta ler com ;
+            df_polars = pl.read_csv(csv_source, separator=';', infer_schema_length=10000, ignore_errors=True)
+        except Exception as e:
+            print(f"⚠️ Aviso: Tentando ler com vírgula. Erro anterior: {e}")
+            df_polars = pl.read_csv(csv_source, separator=',', infer_schema_length=10000)
+    else:
+        df_polars = csv_source
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-            conn.commit()
-        return True
-    except Exception as e:
-        logger.error(f"❌ Erro criando tabela: {e}")
-        return False
+        # Iniciamos a Transação (Tudo ou Nada)
+        with engine.begin() as conn:
+            # 2. IDEMPOTÊNCIA (Limpeza)
+            print(f"🧹 [Idempotência] Apagando dados antigos de {data_ref_iso}...")
+            conn.execute(
+                text(f"DELETE FROM {TABLE_NAME} WHERE data_ref = :dt"),
+                {"dt": data_ref_iso}
+            )
 
-def load_to_database(csv_full_path):
-    if not os.path.exists(csv_full_path): return False
-
-    try:
-        engine = create_engine(DB_URL)
-        conn = engine.raw_connection()
-        
-        if not create_table_if_not_exists(conn):
-            conn.close()
-            return False
-
-        cur = conn.cursor()
-        logger.info(f"⏳ Carga COPY para {TABLE_NAME}...")
-
-        with open(csv_full_path, 'r', encoding='utf-8') as f:
-            next(f) # Pula Header
-            # Atenção: DELIMITER ';' pois o Processor salvou assim
-            sql = f"COPY {TABLE_NAME} FROM STDIN WITH CSV DELIMITER ';' QUOTE '\"' NULL ''"
-            cur.copy_expert(sql, f)
-
-        conn.commit()
-        logger.info(f"✅ Sucesso! {cur.rowcount} linhas.")
-        cur.close()
-        conn.close()
-        return True
+            # 3. CARGA VIA PANDAS (Fallback Seguro)
+            # Convertemos para Pandas aqui porque o to_sql do Pandas aceita a conexão 'conn'
+            # sem tentar recriar a engine, evitando o erro '_instantiate_plugins'.
+            print(f"🔄 Convertendo para Pandas para inserção segura...")
+            df_pandas = df_polars.to_pandas()
+            
+            print(f"🚀 Inserindo {len(df_pandas)} linhas no banco...")
+            
+            df_pandas.to_sql(
+                name=TABLE_NAME,
+                con=conn,
+                if_exists='append',
+                index=False,
+                chunksize=10000 # Insere em lotes para não estourar memória do banco
+            )
+            
+            print(f"✅ Sucesso: {data_ref_iso} carregado e commitado!")
+            return True
 
     except Exception as e:
-        logger.error(f"❌ Erro Loader: {e}")
-        return False
+        print(f"❌ Erro crítico no loader: {e}")
+        raise e

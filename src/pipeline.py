@@ -57,9 +57,14 @@ def run_pipeline(year: str, month: str, force_download=False):
         # 3. Carga
         logger.info("[3/3] Carga (Banco de Dados)...")
         
-        # --- CORREÇÃO AQUI: Passa o caminho completo, não só o nome ---
-        if load_to_database(final_csv_path):
-            logger.info(f"=== ✨ SUCESSO! Dados de {month}/{year} carregados. ===")
+        # --- CORREÇÃO PARA SUBSTITUIÇÃO DE PARTIÇÃO ---
+        # Definimos a data de referência para que o Loader saiba qual mês apagar antes de inserir.
+        # Formato ISO: YYYY-MM-01 (Sempre dia 1)
+        data_ref_iso = f"{year}-{month}-01"
+        
+        # Passamos o path E a data_ref para o loader atualizado
+        if load_to_database(final_csv_path, data_ref_iso):
+            logger.info(f"=== ✨ SUCESSO! Dados de {month}/{year} carregados e limpos. ===")
         else:
             logger.error("❌ Falha na carga do banco.")
             raise Exception("Erro no Loader.")
@@ -69,6 +74,7 @@ def run_pipeline(year: str, month: str, force_download=False):
         logger.info("🧹 Limpando arquivos temporários...")
         try:
             if os.path.exists(txt_path): os.remove(txt_path)
+            # Remove arquivos auxiliares de encoding se existirem
             path_utf8 = txt_path + ".utf8"
             if os.path.exists(path_utf8): os.remove(path_utf8)
         except: pass
@@ -77,7 +83,11 @@ def run_pipeline(year: str, month: str, force_download=False):
         logger.error(f"🔥 Erro no Pipeline: {e}")
         raise e
     finally:
-        if 'ftp' in locals(): ftp.close()
+        # Garante fechamento do FTP se algo der errado antes
+        if 'ftp' in locals() and hasattr(ftp, 'ftp') and ftp.ftp: 
+            try: ftp.close()
+            except: pass
+        
         gc.collect() 
         time.sleep(2)
 
