@@ -1,101 +1,74 @@
 import os
 import logging
-import gc
-import time
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from sqlalchemy import create_engine, text
 
 try:
-    from .config import RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH
+    from .config import DB_URL, RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH, PROCESSED_DIR
+    from .loader import load_to_database
     from .ftp_client import FTPClient
     from .processor import CagedProcessor
-    from .loader import load_to_database
 except ImportError:
-    from src.config import RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH
+    from src.config import DB_URL, RAW_ZIP_DIR, FTP_HOST, FTP_BASE_PATH, PROCESSED_DIR
+    from src.loader import load_to_database
     from src.ftp_client import FTPClient
     from src.processor import CagedProcessor
-    from src.loader import load_to_database
 
-def run_pipeline(year: str, month: str, force_download=False):
-    """
-    Executa o pipeline ETL completo.
-    """
-    filename = f"CAGEDMOV{year}{month}.7z"
-    logger.info(f"=== 🏁 INICIANDO PIPELINE CAGED (SRC): {month}/{year} ===")
+logger = logging.getLogger(__name__)
 
-    ftp = FTPClient(FTP_HOST)
-    processor = CagedProcessor()
+def refresh_sql_model():
+    """Cria as tabelas auxiliares baseadas na tabela principal limpa."""
+    logger.info("🏗️ Atualizando fotos das dimensões...")
+    engine = create_engine(DB_URL)
     
-    try:
-        # 1. Extração
-        logger.info("[1/3] Extração (Download FTP)...")
-        ftp.connect()
+    sqls = [
+        "DROP TABLE IF EXISTS dLocalidade, dSexo, dRaca, dEscolaridade, fMovimentacoes CASCADE;",
         
-        folder_month = f"{year}{month}"
-        remote_path = f"{FTP_BASE_PATH}{year}/{folder_month}/"
+        # Agora usamos os nomes CERTOS que definimos no CONFIG.PY
+        "CREATE TABLE dLocalidade AS SELECT DISTINCT municipio_codigo FROM caged_sp_completo WHERE municipio_codigo IS NOT NULL;",
+        "CREATE TABLE dSexo AS SELECT DISTINCT sexo_codigo FROM caged_sp_completo WHERE sexo_codigo IS NOT NULL;",
+        "CREATE TABLE dRaca AS SELECT DISTINCT raca_cor_codigo FROM caged_sp_completo WHERE raca_cor_codigo IS NOT NULL;",
         
-        zip_path = ftp.download_file(remote_path, filename, RAW_ZIP_DIR)
-        ftp.close()
+        # A Tabela Fato é apenas um espelho da principal, pois já tratamos tudo no processor
+        "CREATE TABLE fMovimentacoes AS SELECT * FROM caged_sp_completo;"
+    ]
+    
+    with engine.begin() as conn:
+        for sql in sqls:
+            conn.execute(text(sql))
+    logger.info("✅ Modelo de dados atualizado!")
 
-        if zip_path is None:
-            logger.warning(f"⚠️ PIPELINE INTERROMPIDO: Arquivo não encontrado.")
-            return 
+def run_pipeline(year, month, force_download=False):
+    ftp = FTPClient(); proc = CagedProcessor()
+    file_types = ["CAGEDMOV", "CAGEDFOR", "CAGEDEXC"]
+    files_loaded = 0
+    
+    # Limpa processados anteriores
+    if os.path.exists(PROCESSED_DIR):
+        for f in os.listdir(PROCESSED_DIR):
+            if f.endswith(".csv"): os.remove(os.path.join(PROCESSED_DIR, f))
 
-        # 2. Transformação
-        logger.info("[2/3] Transformação (ETL + Join)...")
-        txt_path = processor.extract_file(zip_path)
+    ftp.connect()
+    for ftype in file_types:
+        fname = f"{ftype}{year}{month}.7z"
+        local_zip = os.path.join(RAW_ZIP_DIR, fname)
+        if not os.path.exists(local_zip) or force_download:
+            local_zip = ftp.download_file(f"{FTP_BASE_PATH}{year}/{year}{month}/", fname, RAW_ZIP_DIR)
         
-        if not txt_path:
-            raise Exception("Falha na extração do 7z.")
-
-        csv_filename = f"CAGED_SP_{year}_{month}.csv"
-        
-        # O process_data retorna o CAMINHO COMPLETO do CSV gerado
-        final_csv_path = processor.process_data(txt_path, csv_filename, year, month)
-
-        # 3. Carga
-        logger.info("[3/3] Carga (Banco de Dados)...")
-        
-        # --- CORREÇÃO PARA SUBSTITUIÇÃO DE PARTIÇÃO ---
-        # Definimos a data de referência para que o Loader saiba qual mês apagar antes de inserir.
-        # Formato ISO: YYYY-MM-01 (Sempre dia 1)
-        data_ref_iso = f"{year}-{month}-01"
-        
-        # Passamos o path E a data_ref para o loader atualizado
-        if load_to_database(final_csv_path, data_ref_iso):
-            logger.info(f"=== ✨ SUCESSO! Dados de {month}/{year} carregados e limpos. ===")
-        else:
-            logger.error("❌ Falha na carga do banco.")
-            raise Exception("Erro no Loader.")
-        # --------------------------------------------------------------
-
-        # Limpeza
-        logger.info("🧹 Limpando arquivos temporários...")
-        try:
-            if os.path.exists(txt_path): os.remove(txt_path)
-            # Remove arquivos auxiliares de encoding se existirem
-            path_utf8 = txt_path + ".utf8"
-            if os.path.exists(path_utf8): os.remove(path_utf8)
-        except: pass
-
-    except Exception as e:
-        logger.error(f"🔥 Erro no Pipeline: {e}")
-        raise e
-    finally:
-        # Garante fechamento do FTP se algo der errado antes
-        if 'ftp' in locals() and hasattr(ftp, 'ftp') and ftp.ftp: 
-            try: ftp.close()
-            except: pass
-        
-        gc.collect() 
-        time.sleep(2)
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--year', type=str)
-    parser.add_argument('--month', type=str)
-    args = parser.parse_args()
-    if args.year and args.month:
-        run_pipeline(args.year, args.month)
+        if local_zip:
+            txt = proc.extract_file(local_zip)
+            if txt:
+                # Processa e Renomeia Colunas
+                csv = proc.process_data(txt, f"{ftype}_{year}_{month}.csv", year, month, ftype)
+                
+                # Carrega no Banco (O loader vai criar a tabela com os nomes NOVOS e LIMPOS)
+                if load_to_database(csv, f"{year}-{month}-01", ftype):
+                    files_loaded += 1
+                
+                if os.path.exists(txt): os.remove(txt)
+    ftp.close()
+    
+    # Gera o sample com nomes descritivos
+    proc.generate_sample_file()
+    
+    if files_loaded > 0:
+        refresh_sql_model()

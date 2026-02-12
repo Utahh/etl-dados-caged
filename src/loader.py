@@ -1,57 +1,55 @@
 import polars as pl
-import pandas as pd
-from sqlalchemy import create_engine, text
-import os
-from .config import DB_URL, TABLE_NAME
+import logging
+from sqlalchemy import create_engine, text, inspect
 
-def load_to_database(csv_source, data_ref_iso):
+# Tenta importar do config local ou do pacote src (compatibilidade Airflow)
+try:
+    from .config import DB_URL, TABLE_NAME
+except ImportError:
+    from src.config import DB_URL, TABLE_NAME
+
+def load_to_database(csv_source, data_ref_iso, file_type):
     """
-    Carrega os dados no PostgreSQL.
-    Usa Polars para leitura (rápido) e Pandas para escrita (compatível com Transação SQLAlchemy).
+    Carrega o CSV processado para o PostgreSQL.
+    Realiza evolução de esquema (cria colunas novas) e garante idempotência.
     """
     engine = create_engine(DB_URL)
     
-    # 1. Leitura Rápida com Polars
-    if isinstance(csv_source, str):
-        print(f"📂 Lendo CSV com Polars: {csv_source}")
-        try:
-            # Tenta ler com ;
-            df_polars = pl.read_csv(csv_source, separator=';', infer_schema_length=10000, ignore_errors=True)
-        except Exception as e:
-            print(f"⚠️ Aviso: Tentando ler com vírgula. Erro anterior: {e}")
-            df_polars = pl.read_csv(csv_source, separator=',', infer_schema_length=10000)
-    else:
-        df_polars = csv_source
+    # Lê com Polars (Rápido)
+    df = pl.read_csv(csv_source, separator=';', infer_schema_length=10000)
+    
+    # Converte para Pandas para usar o método to_sql (Estável)
+    pandas_df = df.to_pandas()
 
-    try:
-        # Iniciamos a Transação (Tudo ou Nada)
-        with engine.begin() as conn:
-            # 2. IDEMPOTÊNCIA (Limpeza)
-            print(f"🧹 [Idempotência] Apagando dados antigos de {data_ref_iso}...")
+    with engine.begin() as conn:
+        inspector = inspect(engine)
+        
+        # 1. Verifica e Cria Colunas Novas (Evolução de Esquema)
+        if inspector.has_table(TABLE_NAME):
+            columns_in_db = [c['name'] for c in inspector.get_columns(TABLE_NAME)]
+            
+            for col in pandas_df.columns:
+                if col not in columns_in_db:
+                    print(f"✨ Adicionando nova coluna ao banco: {col}")
+                    # Define tipo básico
+                    if col in ['salario', 'valor_salario_fixo']:
+                        col_type = "FLOAT"
+                    elif col in ['saldo_movimentacao']:
+                        col_type = "BIGINT"
+                    else:
+                        col_type = "TEXT"
+                    
+                    conn.execute(text(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}" {col_type};'))
+            
+            # 2. Garante Idempotência (Apaga dados anteriores deste mês/tipo)
             conn.execute(
-                text(f"DELETE FROM {TABLE_NAME} WHERE data_ref = :dt"),
-                {"dt": data_ref_iso}
+                text(f"DELETE FROM {TABLE_NAME} WHERE data_ref_carga = :dt AND tipo_arquivo = :tp"),
+                {"dt": data_ref_iso, "tp": file_type}
             )
-
-            # 3. CARGA VIA PANDAS (Fallback Seguro)
-            # Convertemos para Pandas aqui porque o to_sql do Pandas aceita a conexão 'conn'
-            # sem tentar recriar a engine, evitando o erro '_instantiate_plugins'.
-            print(f"🔄 Convertendo para Pandas para inserção segura...")
-            df_pandas = df_polars.to_pandas()
-            
-            print(f"🚀 Inserindo {len(df_pandas)} linhas no banco...")
-            
-            df_pandas.to_sql(
-                name=TABLE_NAME,
-                con=conn,
-                if_exists='append',
-                index=False,
-                chunksize=10000 # Insere em lotes para não estourar memória do banco
-            )
-            
-            print(f"✅ Sucesso: {data_ref_iso} carregado e commitado!")
-            return True
-
-    except Exception as e:
-        print(f"❌ Erro crítico no loader: {e}")
-        raise e
+        
+        print(f"🚀 Inserindo {len(df)} registros na principal...")
+        
+        # 3. Insere os novos dados
+        pandas_df.to_sql(TABLE_NAME, conn, if_exists='append', index=False, chunksize=10000)
+        
+    return True
