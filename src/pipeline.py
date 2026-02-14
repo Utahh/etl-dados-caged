@@ -1,108 +1,107 @@
 import os
+import glob
 import logging
 from sqlalchemy import create_engine, text
-from datetime import datetime
 
 try:
-    from .config import DB_URL, RAW_ZIP_DIR, REFS_FILES
+    # Ajuste de importação para não depender obrigatoriamente de REFS_FILES
+    from .config import DB_URL, RAW_ZIP_DIR, TABLE_NAME, PROCESSED_DIR
     from .ftp_client import FTPClient
     from .processor import CagedProcessor
     from .loader import load_to_database
 except ImportError:
-    from src.config import DB_URL, RAW_ZIP_DIR, REFS_FILES
+    from src.config import DB_URL, RAW_ZIP_DIR, TABLE_NAME, PROCESSED_DIR
     from src.ftp_client import FTPClient
     from src.processor import CagedProcessor
     from src.loader import load_to_database
 
 logger = logging.getLogger(__name__)
 
-def get_real_col_name(conn, table, possible_names):
-    """Descobre qual nome de coluna realmente existe no banco."""
-    # Essa função evita erros se o nome mudar ligeiramente
-    from sqlalchemy import inspect
-    inspector = inspect(conn)
-    columns = [c['name'] for c in inspector.get_columns(table)]
-    for name in possible_names:
-        if name in columns:
-            return name
-    return possible_names[0] # Retorna o padrão se não achar
-
 def refresh_sql_model():
     """
-    Roda após a carga para atualizar Tabelas Dimensão e Índices.
-    Essencial para o Power BI.
+    Roda apenas UMA VEZ ao final de toda a carga.
+    Cria tabelas auxiliares (Dimensões) e índices para o Power BI.
     """
-    logger.info("🏗️ Atualizando Modelo de Dados (Star Schema)...")
+    logger.info("🏗️ Criando Índices e Tabelas Dimensão (Otimização Final)...")
     engine = create_engine(DB_URL)
     
     with engine.begin() as conn:
-        # 1. Cria Índices de Performance (Deixa o Power BI rápido)
-        # Índice na Data (Para filtros de tempo)
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_caged_data_ref ON caged_sp_completo (data_ref);"))
-        # Índice no Município (Para mapas)
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_caged_municipio ON caged_sp_completo (municipio_codigo);"))
+        # 1. Índices de Performance
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_data_ref ON {TABLE_NAME} (data_ref);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_municipio ON {TABLE_NAME} (municipio_codigo);"))
         
-        # 2. Cria Tabela Dimensão: Localidade (Municípios únicos)
-        logger.info("📍 Atualizando dLocalidade...")
+        # 2. Dimensão Localidade (Municípios únicos)
         conn.execute(text("DROP TABLE IF EXISTS dLocalidade CASCADE;"))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE dLocalidade AS 
             SELECT DISTINCT municipio_codigo 
-            FROM caged_sp_completo 
+            FROM {TABLE_NAME} 
             WHERE municipio_codigo IS NOT NULL;
         """))
         
-        # 3. Cria Tabela Dimensão: Atividades (Seções/CNAE)
-        logger.info("🏭 Atualizando dAtividades...")
+        # 3. Dimensão Atividades (Seções CNAE únicas)
         conn.execute(text("DROP TABLE IF EXISTS dAtividades CASCADE;"))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE dAtividades AS 
-            SELECT DISTINCT secao_codigo, subclasse_codigo
-            FROM caged_sp_completo 
+            SELECT DISTINCT secao_codigo 
+            FROM {TABLE_NAME} 
             WHERE secao_codigo IS NOT NULL;
         """))
 
-    logger.info("✅ Modelo de dados atualizado!")
+    logger.info("✅ Tudo pronto! O banco está otimizado para o Power BI.")
+
+def cleanup_stale_files(keep_last=2):
+    """
+    Mantém apenas os 'keep_last' arquivos mais recentes na pasta processed.
+    Evita lotar o disco do Docker.
+    """
+    types = ["CAGEDMOV", "CAGEDFOR", "CAGEDEXC"]
+    
+    for ftype in types:
+        pattern = os.path.join(PROCESSED_DIR, f"{ftype}_*.csv")
+        files = glob.glob(pattern)
+        files.sort(reverse=True) # Mais novos primeiro
+        
+        if len(files) > keep_last:
+            for f in files[keep_last:]:
+                try:
+                    os.remove(f)
+                    logger.info(f"🧹 Faxina: Removido {os.path.basename(f)}")
+                except OSError as e:
+                    logger.warning(f"⚠️ Erro ao deletar {f}: {e}")
 
 def run_pipeline(year, month, force_download=False):
     processor = CagedProcessor()
     ftp = FTPClient()
     
-    # Lista de arquivos esperados (MOV, FOR, EXC)
-    # Nota: O layout do nome do arquivo muda as vezes, o FTPClient busca pelo padrão
     files_to_process = ["CAGEDMOV", "CAGEDFOR", "CAGEDEXC"]
     
     for ftype in files_to_process:
         try:
             # 1. Download
             local_path = ftp.download_file(year, month, ftype, RAW_ZIP_DIR, force=force_download)
-            if not local_path:
-                logger.warning(f"⚠️ Arquivo {ftype} de {month}/{year} não encontrado. Pulando.")
-                continue
+            if not local_path: continue # Se não achar no FTP, segue o jogo
 
             # 2. Extração
             txt_path = processor.extract_file(local_path)
-            if not txt_path:
-                logger.error(f"❌ Falha ao extrair {local_path}")
-                continue
+            if not txt_path: continue
 
-            # 3. Processamento (Limpeza + Datas)
+            # 3. Processamento
             csv_filename = f"{ftype}_{year}{month}_sp.csv"
             processed_path = processor.process_data(txt_path, csv_filename, year, month, ftype)
 
-            # 4. Carga no Banco (Loader)
-            # Passamos year-month-01 para compor a chave de exclusão (data_arquivo)
+            # 4. Carga no Banco
             data_ref_iso = f"{year}-{month}-01"
             
-            if load_to_database(processed_path, data_ref_iso, ftype):
-                logger.info(f"✅ {ftype} carregado com sucesso!")
+            # Chama o loader
+            load_to_database(processed_path, data_ref_iso, ftype)
             
-            # Limpeza do arquivo temporário extraído (economiza espaço)
+            # Limpa o arquivo TXT bruto extraído para economizar espaço imediato
             if os.path.exists(txt_path): os.remove(txt_path)
 
         except Exception as e:
-            logger.error(f"❌ Erro no pipeline de {ftype}: {e}")
+            logger.error(f"❌ Falha crítica em {ftype}: {e}")
             raise e
-    
-    # 5. Atualiza as Dimensões e Índices no final
-    refresh_sql_model()
+
+    # 5. Faxina da pasta Processed (opcional, roda ao final do mês)
+    cleanup_stale_files(keep_last=2)

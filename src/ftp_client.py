@@ -1,7 +1,6 @@
 import ftplib
 import os
 import logging
-from time import sleep
 
 try:
     from .config import FTP_HOST, FTP_BASE_PATH
@@ -12,85 +11,98 @@ logger = logging.getLogger(__name__)
 
 class FTPClient:
     def __init__(self):
+        self.host = FTP_HOST
+        self.base_path = FTP_BASE_PATH
         self.ftp = None
 
-    def _ensure_connection(self):
-        """Garante que a conexão está ativa, conectando se for a primeira vez ou reconectando se caiu."""
-        # 1. Tenta verificar se a conexão atual está viva
-        if self.ftp:
-            try:
-                self.ftp.voidcmd("NOOP")
-                return # Está viva, pode sair
-            except:
-                logger.warning("⚠️ Conexão FTP caiu ou instável. Reiniciando...")
-                self.ftp = None # Marca como morta para reconectar abaixo
-
-        # 2. Se chegou aqui, é porque self.ftp é None OU a conexão caiu
+    def connect(self):
         try:
-            logger.info(f"🔌 Conectando ao FTP: {FTP_HOST}...")
-            self.ftp = ftplib.FTP(FTP_HOST)
+            logger.info(f"🔌 Conectando ao FTP: {self.host}...")
+            self.ftp = ftplib.FTP(self.host)
             self.ftp.login()
-            logger.info("✅ Conexão estabelecida com sucesso!")
+            logger.info("✅ Conexão OK!")
         except Exception as e:
-            logger.error(f"❌ Falha crítica ao conectar no FTP: {e}")
-            raise e
+            logger.error(f"❌ Erro conexão FTP: {e}"); raise e
 
-    def _find_file_in_ftp(self, path, prefix):
-        """
-        Procura um arquivo no FTP que comece com o prefixo.
-        """
+    def is_valid_7z(self, file_path):
+        """Verifica se o arquivo é realmente um 7z olhando o cabeçalho (Magic Bytes)"""
+        if not os.path.exists(file_path): return False
+        if os.path.getsize(file_path) < 1000: return False # Muito pequeno
+        
         try:
-            self._ensure_connection() # Garante conexão antes de tentar listar
-            self.ftp.cwd(path)
-            files = self.ftp.nlst()
-            for f in files:
-                if f.upper().startswith(prefix.upper()) and f.endswith(".7z"):
-                    return f
-            return None
-        except Exception as e:
-            # Não vamos logar erro crítico aqui para não sujar o log se o arquivo só não existir
-            # Mas se for erro de conexão, o _ensure_connection já teria pegado
-            logger.warning(f"⚠️ Não foi possível listar arquivos em {path}: {e}")
-            return None
+            with open(file_path, 'rb') as f:
+                header = f.read(6)
+                # Assinatura do 7zip: 37 7A BC AF 27 1C
+                return header == b'\x37\x7a\xbc\xaf\x27\x1c'
+        except:
+            return False
 
     def download_file(self, year, month, file_type, output_dir, force=False):
-        """
-        Baixa o arquivo do FTP.
-        """
-        self._ensure_connection()
+        filename_options = [
+            f"{file_type}{year}{month}.7z",
+            f"{file_type}{year}{month}.7z",
+            f"{file_type}{year}{month}.txt.7z"
+        ]
         
-        ftp_dir = f"{FTP_BASE_PATH}{year}/{year}{month}/"
-        file_prefix = f"{file_type}{year}{month}"
-        
-        # Tenta achar o arquivo
-        filename = self._find_file_in_ftp(ftp_dir, file_prefix)
-        
-        if not filename:
-            logger.warning(f"⚠️ Arquivo não encontrado no FTP: {ftp_dir}{file_prefix}*")
+        # 1. Checa Cache
+        for fname in filename_options:
+            path = os.path.join(output_dir, fname)
+            if os.path.exists(path):
+                if self.is_valid_7z(path):
+                    if not force:
+                        logger.info(f"📂 Cache válido encontrado: {fname}")
+                        return path
+                else:
+                    logger.warning(f"⚠️ Arquivo corrompido ou falso no cache: {fname}. Deletando...")
+                    os.remove(path)
+
+        if not self.ftp: self.connect()
+
+        # 2. Navega e Busca
+        ftp_dir = f"{self.base_path}{year}/{year}{month}/"
+        try:
+            self.ftp.cwd(ftp_dir)
+        except:
+            logger.warning(f"Pasta {ftp_dir} não existe.")
             return None
 
-        local_path = os.path.join(output_dir, filename)
+        try: files_list = self.ftp.nlst()
+        except: files_list = []
 
-        if os.path.exists(local_path) and not force:
-            logger.info(f"📂 Arquivo já existe em cache: {filename}")
-            return local_path
+        found_remote = None
+        for remote in files_list:
+            if file_type.upper() in remote.upper() and f"{year}{month}" in remote and remote.endswith(".7z"):
+                found_remote = remote
+                break
+        
+        if not found_remote:
+            logger.warning(f"Arquivo {file_type} não encontrado no FTP.")
+            return None
 
-        logger.info(f"⬇️ Baixando: {filename}...")
+        # 3. Download
+        local_path = os.path.join(output_dir, found_remote)
+        logger.info(f"⬇️ Baixando {found_remote}...")
         
         try:
             with open(local_path, 'wb') as f:
-                self.ftp.retrbinary(f"RETR {filename}", f.write)
-            logger.info("✅ Download concluído!")
-            return local_path
-        except Exception as e:
-            if os.path.exists(local_path):
+                self.ftp.retrbinary(f"RETR {found_remote}", f.write)
+            
+            if self.is_valid_7z(local_path):
+                logger.info("✅ Download e validação OK!")
+                return local_path
+            else:
+                logger.error("❌ O arquivo baixado não é um 7zip válido (provavelmente erro do servidor).")
                 os.remove(local_path)
-            logger.error(f"❌ Erro no download: {e}")
-            raise e
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Erro download: {e}")
+            if os.path.exists(local_path): os.remove(local_path)
+            self.close()
+            return None
 
     def close(self):
         if self.ftp:
-            try:
-                self.ftp.quit()
-            except:
-                self.ftp.close()
+            try: self.ftp.quit()
+            except: pass
+            self.ftp = None

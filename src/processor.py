@@ -3,6 +3,7 @@ import os
 import logging
 import unicodedata
 import re
+import subprocess
 from datetime import datetime, date
 
 try:
@@ -23,88 +24,105 @@ def normalizar_texto(texto):
 class CagedProcessor:
     def __init__(self):
         self.column_mapping = COLUMNS_MAP
-        self.sample_rows = []
+
+    def extract_file(self, zip_path):
+        """Extrai o arquivo .7z de forma robusta."""
+        try:
+            folder = os.path.dirname(zip_path)
+            cmd = ["7z", "e", zip_path, f"-o{folder}", "-y"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                logger.error(f"❌ Erro no 7z: {result.stderr}")
+                return None
+            
+            files_in_folder = os.listdir(folder)
+            extracted_files = [f for f in files_in_folder if f.lower().endswith(('.txt', '.csv'))]
+            
+            if not extracted_files:
+                return None
+            
+            return os.path.join(folder, extracted_files[0])
+            
+        except Exception as e:
+            logger.error(f"❌ Erro crítico extração: {e}")
+            return None
 
     def process_data(self, txt_path, csv_filename, year, month, file_type):
         logger.info(f"🔨 Processando {file_type}...")
         try:
             # 1. Leitura
-            df = pl.read_csv(txt_path, separator=';', encoding='iso-8859-1', infer_schema_length=0)
+            df = pl.read_csv(
+                txt_path, 
+                separator=';', 
+                encoding='utf8-lossy', 
+                infer_schema_length=0, 
+                ignore_errors=True
+            )
             
-            # 2. Limpeza de Cabeçalho (Normalização)
-            mapa_limpeza = {c: normalizar_texto(c) for c in df.columns} 
-            df = df.rename(mapa_limpeza)
+            # 2. Normalização de Nomes
+            novo_mapa = {}
+            for col in df.columns:
+                col_limpa = normalizar_texto(col)
+                nome_final = self.column_mapping.get(col_limpa, col_limpa)
+                novo_mapa[col] = nome_final
 
-            # 3. Filtro SP (AQUI ESTAVA O ERRO)
-            # O nome da coluna original é 'uf' (limpo), não 'uf_codigo' ainda.
-            # Convertemos para int para garantir que bata com o número 35
-            if "uf" in df.columns:
-                df = df.filter(pl.col("uf").cast(pl.Int64, strict=False) == 35)
-            elif "uf_codigo" in df.columns:
+            df = df.rename(novo_mapa)
+
+            # 3. Filtro SP
+            if "uf_codigo" in df.columns:
                 df = df.filter(pl.col("uf_codigo").cast(pl.Int64, strict=False) == 35)
-            
-            # Se não achar nenhuma das duas, loga um aviso (mas não quebra, caso o layout mude)
-            else:
-                logger.warning(f"⚠️ Coluna de UF não encontrada em {file_type}. Colunas: {df.columns}")
+            elif "uf" in df.columns:
+                df = df.filter(pl.col("uf").cast(pl.Int64, strict=False) == 35)
 
-            # 4. Renomeação Oficial (Mapping do Config)
-            cols_to_rename = {k: v for k, v in self.column_mapping.items() if k in df.columns}
-            df = df.rename(cols_to_rename)
+            # 4. Tratamento de Moeda
+            cols_moeda = ["salario", "valor_salario_fixo"]
+            for c in cols_moeda:
+                if c in df.columns:
+                    df = df.with_columns(
+                        pl.col(c)
+                        .str.replace(r"R\$", "")
+                        .str.replace(r"\.", "")
+                        .str.replace(",", ".")
+                        .cast(pl.Float64, strict=False)
+                        .fill_null(0.0)
+                    )
 
-            # 5. Tratamento de Tipos Básicos
-            if "salario" in df.columns:
-                df = df.with_columns(pl.col("salario").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0))
-            
-            if "saldo_movimentacao" in df.columns:
-                df = df.with_columns(pl.col("saldo_movimentacao").cast(pl.Int64, strict=False).fill_null(0))
-                if file_type == "CAGEDEXC":
-                    df = df.with_columns((pl.col("saldo_movimentacao") * -1).alias("saldo_movimentacao"))
+            # 5. Tratamento de Exclusão
+            if file_type == "CAGEDEXC" and "saldo_movimentacao" in df.columns:
+                df = df.with_columns(
+                    (pl.col("saldo_movimentacao").cast(pl.Int64, strict=False) * -1)
+                )
 
-            # --- 6. DATAS ---
-            
-            # A) data_ref (Baseado na competência)
+            # --- CORREÇÃO SOLICITADA: CONVERTER COMPETÊNCIA PARA DATA ---
+            # Transforma 202501 (Int/String) em 2025-01-01 (Date)
             if "competencia_mov" in df.columns:
                 df = df.with_columns(
                     pl.col("competencia_mov")
-                    .cast(pl.Utf8)
-                    .add("01")
-                    .str.strptime(pl.Date, "%Y%m%d")
-                    .alias("data_ref")
+                    .cast(pl.Utf8)       # Garante que é texto "202501"
+                    .add("01")           # Concatena dia 01 -> "20250101"
+                    .str.strptime(pl.Date, "%Y%m%d", strict=False) # Converte para DATA REAL
+                    .alias("competencia_mov") # Sobrescreve a coluna original
                 )
 
-            # B) data_arquivo
-            data_arquivo_dt = date(int(year), int(month), 1)
+            # 6. Metadados
+            data_ref_iso = f"{year}-{month}-01"
+            df = df.with_columns(pl.lit(data_ref_iso).alias("data_ref"))
             
-            # C) data_processamento
-            data_hoje_dt = datetime.now()
+            # Força data_ref como Date também (caso já não esteja)
+            df = df.with_columns(pl.col("data_ref").cast(pl.Date))
 
             df = df.with_columns([
-                pl.lit(data_arquivo_dt).alias("data_arquivo"),
-                pl.lit(data_hoje_dt).alias("data_processamento"),
+                pl.lit(date(int(year), int(month), 1)).alias("data_arquivo"),
+                pl.lit(datetime.now()).alias("data_processamento"),
                 pl.lit(file_type).alias("tipo_arquivo")
             ])
-            # ----------------
 
-            self.sample_rows.append(df.head(2))
+            # 7. Salva
             output_path = os.path.join(PROCESSED_DIR, csv_filename)
-            df.write_csv(output_path, separator=';')
+            # Salvando com formato de data ISO
+            df.write_csv(output_path, separator=';', datetime_format="%Y-%m-%d")
             return output_path
 
         except Exception as e:
             logger.error(f"❌ Erro Processor: {e}"); raise e
-
-    # ... Resto do código (generate_sample_file e extract_file) igual ...
-    def generate_sample_file(self):
-        if self.sample_rows:
-            sample_df = pl.concat(self.sample_rows, how="diagonal")
-            sample_path = os.path.join(PROCESSED_DIR, "tabela_geral_sample.csv")
-            sample_df.write_csv(sample_path, separator=';')
-
-    def extract_file(self, zip_path):
-        import py7zr
-        output_dir = os.path.dirname(zip_path)
-        with py7zr.SevenZipFile(zip_path, mode='r') as z:
-            z.extractall(path=output_dir)
-            for f in z.getnames():
-                if f.lower().endswith(('.txt', '.csv')): return os.path.join(output_dir, f)
-        return None
