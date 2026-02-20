@@ -94,22 +94,19 @@ class CagedProcessor:
                     (pl.col("saldo_movimentacao").cast(pl.Int64, strict=False) * -1)
                 )
 
-            # --- CORREÇÃO SOLICITADA: CONVERTER COMPETÊNCIA PARA DATA ---
-            # Transforma 202501 (Int/String) em 2025-01-01 (Date)
+            # 6. Converte competência para Data Real
             if "competencia_mov" in df.columns:
                 df = df.with_columns(
                     pl.col("competencia_mov")
-                    .cast(pl.Utf8)       # Garante que é texto "202501"
-                    .add("01")           # Concatena dia 01 -> "20250101"
-                    .str.strptime(pl.Date, "%Y%m%d", strict=False) # Converte para DATA REAL
-                    .alias("competencia_mov") # Sobrescreve a coluna original
+                    .cast(pl.Utf8)       
+                    .add("01")           
+                    .str.strptime(pl.Date, "%Y%m%d", strict=False) 
+                    .alias("competencia_mov") 
                 )
 
-            # 6. Metadados
+            # 7. Metadados
             data_ref_iso = f"{year}-{month}-01"
             df = df.with_columns(pl.lit(data_ref_iso).alias("data_ref"))
-            
-            # Força data_ref como Date também (caso já não esteja)
             df = df.with_columns(pl.col("data_ref").cast(pl.Date))
 
             df = df.with_columns([
@@ -118,9 +115,8 @@ class CagedProcessor:
                 pl.lit(file_type).alias("tipo_arquivo")
             ])
 
-            # 7. Salva
+            # 8. Salva
             output_path = os.path.join(PROCESSED_DIR, csv_filename)
-            # Salvando com formato de data ISO
             df.write_csv(output_path, separator=';', datetime_format="%Y-%m-%d")
             return output_path
 
