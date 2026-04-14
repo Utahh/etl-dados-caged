@@ -3,7 +3,7 @@ import os
 import logging
 import unicodedata
 import re
-import subprocess
+import py7zr  # Substitui o subprocess para extração nativa
 from datetime import datetime, date
 
 try:
@@ -26,26 +26,44 @@ class CagedProcessor:
         self.column_mapping = COLUMNS_MAP
 
     def extract_file(self, zip_path):
-        """Extrai o arquivo .7z de forma robusta."""
+        """Extrai o arquivo .7z de forma robusta e 100% Python."""
+        logger.info(f"📦 Iniciando extração nativa de: {zip_path}")
         try:
             folder = os.path.dirname(zip_path)
-            cmd = ["7z", "e", zip_path, f"-o{folder}", "-y"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
             
-            if result.returncode != 0:
-                logger.error(f"❌ Erro no 7z: {result.stderr}")
-                return None
+            # Antecipação: Garante que a pasta de destino existe
+            os.makedirs(folder, exist_ok=True)
             
-            files_in_folder = os.listdir(folder)
-            extracted_files = [f for f in files_in_folder if f.lower().endswith(('.txt', '.csv'))]
+            extracted_filename = None
             
-            if not extracted_files:
-                return None
+            # mode='r' lê o arquivo usando py7zr
+            with py7zr.SevenZipFile(zip_path, mode='r') as archive:
+                # LÓGICA ESPECIALISTA: Descobre os nomes dos arquivos DENTRO do 7z
+                # Isso evita ler arquivos residuais de execuções anteriores no mesmo diretório
+                all_files_in_archive = archive.getnames()
+                target_files = [f for f in all_files_in_archive if f.lower().endswith(('.txt', '.csv'))]
+                
+                if not target_files:
+                    logger.error(f"❌ Nenhum arquivo .txt ou .csv válido dentro de {zip_path}")
+                    return None
+                
+                extracted_filename = target_files[0]
+                
+                # Extrai fisicamente para a pasta
+                archive.extractall(path=folder)
             
-            return os.path.join(folder, extracted_files[0])
+            final_path = os.path.join(folder, extracted_filename)
+            logger.info(f"✅ Extração concluída: {final_path}")
+            return final_path
             
+        except py7zr.exceptions.Bad7zFile:
+            logger.error(f"❌ Erro Crítico: O arquivo {zip_path} está corrompido ou não é um .7z válido (Falha no FTP?).")
+            return None
+        except MemoryError:
+            logger.error(f"❌ Erro de Memória (OOM): O Airflow Worker não tem RAM suficiente para extrair {zip_path}.")
+            return None
         except Exception as e:
-            logger.error(f"❌ Erro crítico extração: {e}")
+            logger.error(f"❌ Erro crítico extração py7zr: {e}")
             return None
 
     def process_data(self, txt_path, csv_filename, year, month, file_type):
