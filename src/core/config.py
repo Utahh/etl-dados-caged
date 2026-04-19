@@ -14,7 +14,7 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(REFS_DIR, exist_ok=True)
 
 # --- CONEXÃO COM O BANCO ---
-DB_URL = "postgresql://airflow:airflow@caged_postgres:5432/airflow"
+DB_URL = "postgresql+psycopg2://airflow:airflow@postgres:5432/airflow"
 TABLE_NAME = "caged_sp_completo"
 
 # --- CONFIGURAÇÃO FTP ---

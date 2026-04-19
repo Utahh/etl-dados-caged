@@ -6,10 +6,8 @@ import re
 import py7zr  # Substitui o subprocess para extração nativa
 from datetime import datetime, date
 
-try:
-    from .config import COLUMNS_MAP, PROCESSED_DIR
-except ImportError:
-    from src.config import COLUMNS_MAP, PROCESSED_DIR
+# --- CORREÇÃO DE IMPORTAÇÃO (ARQUITETURA LAKEHOUSE) ---
+from src.core.config import COLUMNS_MAP, PROCESSED_DIR
 
 logger = logging.getLogger(__name__)
 

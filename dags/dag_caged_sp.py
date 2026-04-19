@@ -1,27 +1,28 @@
 import sys
-import os
 import logging
 from datetime import datetime
+import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models.param import Param
 
 # --- FIX DE IMPORTAÇÃO ---
-# Garante que o Airflow encontre seus scripts na pasta /opt/airflow
 PROJECT_ROOT = "/opt/airflow"
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
+
+# Fuso horário de Brasília/SP para evitar bugs na janela móvel Automática
+local_tz = pendulum.timezone("America/Sao_Paulo")
 
 # --- CONFIGURAÇÃO DA DAG ---
 default_args_config = { 
     'owner': 'airflow',
     'depends_on_past': False,
     'email_on_failure': False,
-    'retries': 0,
+    'retries': 1, # Retry de segurança caso o FTP do governo oscile
 }
 
-# Parâmetros Visuais (Formulário no Airflow)
-params = {
+params_config = {
     "modo_execucao": Param("Manual_Periodo", enum=["Automatico", "Manual_Mes_Unico", "Manual_Periodo"], description="Modo de Execução"),
     "ano_inicio": Param("2025", type=["string", "null"], description="[Manual] Ano Início (Ex: 2025)"),
     "mes_inicio": Param("01", type=["string", "null"], description="[Manual] Mês Início (Ex: 01)"),
@@ -32,19 +33,18 @@ params = {
 with DAG(
     'dag_caged_sp_v5_final',
     default_args=default_args_config,
-    description='Pipeline CAGED SP - Carga Otimizada + Star Schema',
+    description='Pipeline CAGED SP - Carga Otimizada Lakehouse',
     schedule_interval=None,
-    start_date=datetime(2025, 1, 1),
+    start_date=datetime(2025, 1, 1, tzinfo=local_tz),
     catchup=False,
-    tags=['caged', 'botucatu', 'producao'],
-    params=params
+    tags=['caged', 'botucatu', 'producao', 'addai-core'],
+    params=params_config
 ) as dag:
 
     def task_wrapper(**kwargs):
-        # Importação tardia para garantir que o sys.path já carregou
         try:
-            # IMPORTANTE: Trazemos também o refresh_sql_model
-            from src.pipeline import run_pipeline, refresh_sql_model
+            # --- O AJUSTE CRÍTICO DA ARQUITETURA LAKEHOUSE ESTÁ AQUI ---
+            from src.domains.caged.pipeline import run_pipeline, refresh_sql_model
         except ImportError as e:
             logging.error(f"⚠️ Erro de importação: {e}")
             logging.error(f"🔍 sys.path atual: {sys.path}")
@@ -55,17 +55,15 @@ with DAG(
         modo = params.get('modo_execucao', 'Manual_Periodo')
         
         logging.info(f"⚙️ MODO SELECIONADO: {modo}")
-        
         lista_processamento = []
 
-        # Lógica Automática (Janela móvel baseada na data atual do servidor)
+        # Lógica Automática com Fuso Horário Correto
         if modo == "Automatico":
             logging.info("📅 Calculando janela móvel de 12 meses...")
-            hoje = datetime.now()
-            meses_atras = 2 # Lag de segurança do governo
+            hoje = pendulum.now(local_tz)
+            meses_atras = 2 
             
             for i in range(12):
-                # Matemática para voltar meses corretamente
                 total_meses = (hoje.year * 12 + hoje.month - 1) - (meses_atras + i)
                 ano_calc = total_meses // 12
                 mes_calc = (total_meses % 12) + 1
@@ -80,7 +78,7 @@ with DAG(
                 raise ValueError("⚠️ Ano e Mês INICIAIS são obrigatórios!")
 
             if modo == "Manual_Mes_Unico":
-                lista_processamento = [(ano_i, mes_i.zfill(2))]
+                lista_processamento = [(ano_i, str(mes_i).zfill(2))]
             
             elif modo == "Manual_Periodo":
                 ano_f = params.get('ano_fim')
@@ -97,7 +95,6 @@ with DAG(
 
                 while dt_atual <= dt_fim:
                     lista_processamento.append((str(dt_atual.year), str(dt_atual.month).zfill(2)))
-                    # Avança 1 mês
                     if dt_atual.month == 12:
                         dt_atual = dt_atual.replace(year=dt_atual.year + 1, month=1)
                     else:
@@ -108,23 +105,26 @@ with DAG(
             logging.warning("⚠️ Nenhuma data para processar.")
             return
 
+        # Ordena a lista do mais antigo para o mais novo cronologicamente
+        lista_processamento.sort(key=lambda x: (x[0], x[1]))
+
         logging.info(f"📋 Processando {len(lista_processamento)} competências...")
 
         for idx, (ano, mes) in enumerate(lista_processamento):
             logging.info(f"▶️ [{idx+1}/{len(lista_processamento)}] Carga de: {mes}/{ano}...")
-            run_pipeline(ano, mes) # Executa download, tratamento e copy
+            # Como a nossa carga usa DELETE antes do COPY, é 100% segura para reprocessar
+            run_pipeline(ano, mes) 
 
-        # --- 3. OTIMIZAÇÃO FINAL (O PULO DO GATO) ---
+        # --- 3. OTIMIZAÇÃO FINAL ---
         logging.info("\n---")
         logging.info("🏁 Carga de dados finalizada com sucesso.")
         logging.info("🏗️ Rodando Otimização do Modelo (Star Schema e Índices)...")
         
-        refresh_sql_model() # <--- AQUI ESTÁ A MÁGICA
+        refresh_sql_model() 
         
         logging.info("🚀 Pipeline concluído! O Power BI já pode ser atualizado.")
 
     run_task = PythonOperator(
         task_id='run_caged_pipeline_completo',
-        python_callable=task_wrapper,
-        provide_context=True
+        python_callable=task_wrapper
     )
